@@ -4,6 +4,8 @@
 non-interactive print mode, provider adapters, editable Markdown modes, and
 Markdown plugins that can install helper scripts.
 
+![mini TUI screenshot](docs/assets/tui-screenshot.png)
+
 ## Highlights
 
 - **Interactive TUI** by default; `mini -p` for non-interactive print mode.
