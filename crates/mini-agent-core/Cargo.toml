@@ -1,0 +1,19 @@
+[package]
+name = "mini-agent-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1.0.98"
+base64 = "0.22.1"
+minijinja = "2.9.0"
+rand = "0.8.5"
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+toml = "0.8.22"
+url = "2.5.7"
+which = "7.0.3"

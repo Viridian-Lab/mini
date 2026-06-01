@@ -1,0 +1,17 @@
+[package]
+name = "mini-agent-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "mini"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.40", features = ["derive"] }
+mini-agent-core = { path = "../mini-agent-core" }
+mini-agent-tui = { path = "../mini-agent-tui" }
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1.0.140"
