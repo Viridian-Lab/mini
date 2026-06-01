@@ -3,10 +3,12 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::{cursor, execute, queue, terminal};
 use mini_agent_core::{
     Agent, AgentEvent, BUILT_IN_PROVIDER_NAMES, Config, DEFAULT_CONTEXT_WINDOW_TOKENS,
-    DEFAULT_SYSTEM_PROMPT, ModelMessage, ModelRole, Plugin, PluginKind, ProviderConfig,
-    compose_prompt, estimate_messages_tokens, list_models, load_plugin,
+    DEFAULT_SYSTEM_PROMPT, ModelMessage, ModelRole, Plugin, PluginError, PluginKind,
+    ProviderConfig, compose_prompt, estimate_messages_tokens, install_scripts, list_models,
+    load_plugin,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,7 +61,7 @@ const MESSAGE_INDENT: usize = 3;
 const OUTPUT_HEAD_LINES: usize = 24;
 const OUTPUT_TAIL_LINES: usize = 8;
 const STREAM_UNSTABLE_ROWS: usize = 8;
-const SLASH_COMMANDS: [&str; 10] = [
+const SLASH_COMMANDS: [&str; 11] = [
     "/help",
     "/provider",
     "/model",
@@ -68,6 +70,7 @@ const SLASH_COMMANDS: [&str; 10] = [
     "/effort",
     "/session",
     "/resume",
+    "/reload",
     "/compact",
     "/compact status",
 ];
@@ -158,9 +161,11 @@ struct App {
     session_title: Option<String>,
     selection: Option<Selection>,
     plugins: Vec<Plugin>,
+    plugin_specs: Vec<PathBuf>,
     cwd: PathBuf,
     append_system_prompt: Option<String>,
     ignore_plugin_errors: bool,
+    yolo: bool,
     agent: Option<Agent>,
     running: Option<RunningAgent>,
 }
@@ -170,9 +175,11 @@ pub struct RunOptions {
     pub config: Config,
     pub mode: String,
     pub plugins: Vec<Plugin>,
+    pub plugin_specs: Vec<PathBuf>,
     pub cwd: PathBuf,
     pub append_system_prompt: Option<String>,
     pub ignore_plugin_errors: bool,
+    pub yolo: bool,
     pub resume: Option<String>,
     pub session_id: Option<String>,
 }

@@ -79,9 +79,11 @@ pub fn run(options: RunOptions) -> Result<()> {
         session_title,
         selection: None,
         plugins: options.plugins,
+        plugin_specs: options.plugin_specs,
         cwd: options.cwd,
         append_system_prompt: options.append_system_prompt,
         ignore_plugin_errors: options.ignore_plugin_errors,
+        yolo: options.yolo,
         agent: Some(agent),
         running: None,
     };

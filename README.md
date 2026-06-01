@@ -78,6 +78,7 @@ Useful slash commands inside the TUI:
 /effort [none|on|minimal|low|medium|high|xhigh|custom]
 /session
 /resume [session]
+/reload
 /compact
 /compact status
 ```

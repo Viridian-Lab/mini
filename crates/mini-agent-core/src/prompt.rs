@@ -3,7 +3,7 @@ use crate::plugin::{Plugin, PluginKind, active_plugin_id_set};
 use anyhow::Result;
 use std::path::Path;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are mini, a small terminal coding agent. You should use the tools provided when they seem useful (i.e. creating memories when something is important, using subagents when the problem can be broken into smaller parallel tasks, etc.) You interface with the system entirely through the shell.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are mini, a coding agent.";
 
 pub fn compose_prompt(
     system_prompt: &str,

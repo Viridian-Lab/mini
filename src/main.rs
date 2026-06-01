@@ -422,9 +422,11 @@ fn main() -> Result<()> {
             config,
             mode: mode.id,
             plugins,
+            plugin_specs: cli.plugins.clone(),
             cwd,
             append_system_prompt: cli.append_system_prompt,
             ignore_plugin_errors: cli.ignore,
+            yolo: cli.yolo,
             resume: cli.resume,
             session_id: cli.session,
         })?;

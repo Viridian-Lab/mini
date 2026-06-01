@@ -14,6 +14,7 @@ fn handle_slash_command(app: &mut App, prompt: &str) -> Result<()> {
                     "/effort [none|on|minimal|low|medium|high|xhigh|custom]",
                     "/session",
                     "/resume [session]",
+                    "/reload",
                     "/compact",
                     "/compact status",
                 ]
@@ -161,6 +162,12 @@ resume with: mini --resume {}",
             });
             Ok(())
         }
+        "/reload" => {
+            if let Some(extra) = parts.next() {
+                anyhow::bail!("unknown /reload argument '{extra}'; try /reload");
+            }
+            reload_configuration(app)
+        }
         "/compact" => match parts.next() {
             Some("status") => {
                 let agent = app.agent.as_ref().context("agent is already running")?;
@@ -279,6 +286,139 @@ fn sync_command_palette(app: &mut App) {
         items,
         selected,
     });
+}
+
+
+fn reload_configuration(app: &mut App) -> Result<()> {
+    let mut config = Config::load_default().context("failed to reload ~/.mini-agent/config.toml")?;
+    let mode_spec = app.mode.clone();
+    let mode = load_plugin(&mode_spec).with_context(|| format!("failed to reload mode '{mode_spec}'"))?;
+    if mode.kind != PluginKind::Mode {
+        anyhow::bail!("plugin '{}' is not a mode", mode.id);
+    }
+
+    let (plugins, skipped_plugins) =
+        load_active_plugins(&config, &app.plugin_specs, &app.cwd, app.ignore_plugin_errors)?;
+    if let Some(paths) = Config::user_paths() {
+        install_scripts(
+            &paths,
+            &mode,
+            &plugins,
+            &app.cwd,
+            app.yolo,
+            app.ignore_plugin_errors,
+        )?;
+    } else if !mode.scripts.is_empty() || plugins.iter().any(|plugin| !plugin.scripts.is_empty()) {
+        anyhow::bail!(
+            "HOME is not set, so plugin scripts cannot be installed under ~/.mini-agent/bin"
+        );
+    }
+
+    let system = compose_prompt(
+        DEFAULT_SYSTEM_PROMPT,
+        Some(&mode),
+        &plugins,
+        &app.cwd,
+        app.append_system_prompt.as_deref(),
+        app.ignore_plugin_errors,
+    )?;
+    config.agent.default_mode = mode.id.clone();
+
+    let agent = app.agent.as_mut().context("agent is already running")?;
+    agent.system = system;
+    agent.config = config;
+
+    app.provider = agent.config.model.provider.clone();
+    app.model = agent.config.model.model.clone();
+    app.effort = agent.config.model.reasoning_effort.clone();
+    app.context_window_tokens = agent
+        .config
+        .agent
+        .context_window_tokens
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    app.context_percent = Some(context_percent_for(
+        &agent.system,
+        &agent.messages,
+        app.context_window_tokens,
+    ));
+    app.mode = mode.id.clone();
+    app.plugins = plugins;
+
+    let plugin_count = app.plugins.len();
+    let mut text = format!(
+        "reloaded config, mode {}, and {plugin_count} plugin{}",
+        app.mode,
+        if plugin_count == 1 { "" } else { "s" }
+    );
+    if !skipped_plugins.is_empty() {
+        text.push_str("\nskipped plugins:\n");
+        text.push_str(&skipped_plugins.join("\n"));
+    }
+    app.messages.push(Message {
+        role: Role::Local,
+        text,
+        output: None,
+    });
+    Ok(())
+}
+
+fn load_active_plugins(
+    config: &Config,
+    plugin_specs: &[PathBuf],
+    cwd: &PathBuf,
+    ignore_plugin_errors: bool,
+) -> Result<(Vec<Plugin>, Vec<String>)> {
+    let mut plugins = Vec::new();
+    for spec in &config.agent.plugins {
+        let plugin = match load_plugin(spec).with_context(|| format!("failed to load plugin '{spec}'")) {
+            Ok(plugin) => plugin,
+            Err(_) if ignore_plugin_errors => continue,
+            Err(err) => return Err(err),
+        };
+        if plugin.kind != PluginKind::Plugin {
+            if ignore_plugin_errors {
+                continue;
+            }
+            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
+        }
+        plugins.push(plugin);
+    }
+    for path in plugin_specs {
+        let plugin = match load_plugin(path)
+            .with_context(|| format!("failed to load plugin '{}'", path.display()))
+        {
+            Ok(plugin) => plugin,
+            Err(_) if ignore_plugin_errors => continue,
+            Err(err) => return Err(err),
+        };
+        if plugin.kind != PluginKind::Plugin {
+            if ignore_plugin_errors {
+                continue;
+            }
+            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
+        }
+        plugins.push(plugin);
+    }
+    plugins.sort_by(|left, right| left.id.cmp(&right.id));
+    plugins.dedup_by(|left, right| left.id == right.id);
+
+    let active_plugins = plugins
+        .iter()
+        .map(|plugin| plugin.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut available_plugins = Vec::new();
+    let mut skipped_plugins = Vec::new();
+    for plugin in plugins {
+        match plugin.render(cwd, &active_plugins) {
+            Ok(_) => available_plugins.push(plugin),
+            Err(err @ PluginError::MissingCommand { .. }) => {
+                skipped_plugins.push(format!("{}: {err}", plugin.id));
+            }
+            Err(_) if ignore_plugin_errors => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok((available_plugins, skipped_plugins))
 }
 
 fn resume_session(app: &mut App, session: &str) -> Result<()> {

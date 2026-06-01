@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const ACTION_INSTRUCTION: &str = "When shell work is needed, call the `bash` tool with a `command` string. The runtime executes each command with `bash -lc` in the current workspace. Use normal markdown code blocks only for examples; code blocks are never executed. When the user's request is complete and no shell work is needed, respond normally without a tool call; the runtime will stop and return that response to the user.";
+pub const ACTION_INSTRUCTION: &str = "When shell work is needed, call the `bash` tool with a `command` string. The runtime executes each command with `bash -lc` in the current workspace. Use normal markdown code blocks only for examples; code blocks are never executed. When the user's request is complete and no shell work is needed, respond normally without a tool call; the runtime will stop and return that response to the user. You should use the tools provided when they seem useful (i.e. creating memories when something is important, using subagents when the problem can be broken into smaller parallel tasks, etc.)";
 
 const DEFAULT_CONFIG: &str = r#"[agent]
 default_mode = "default"
