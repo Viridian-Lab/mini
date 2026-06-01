@@ -1,3 +1,31 @@
+[package]
+name = "viridian-mini"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme = "README.md"
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "docs/assets/tui-screenshot.png",
+    "src/main.rs",
+]
+
+[[bin]]
+name = "mini"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.40", features = ["derive"] }
+mini-agent-core = { package = "viridian-mini-core", path = "crates/mini-agent-core", version = "0.1.0" }
+mini-agent-tui = { package = "viridian-mini-tui", path = "crates/mini-agent-tui", version = "0.1.0" }
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1.0.140"
+
 [workspace]
 members = [
     "crates/mini-agent-cli",
@@ -10,4 +38,6 @@ resolver = "2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
+description = "A small Rust terminal coding agent with a TUI and Markdown plugins"
+repository = "https://github.com/Viridian-Lab/mini"
 

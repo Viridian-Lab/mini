@@ -772,41 +772,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "mini-agent-core",
- "mini-agent-tui",
  "reqwest",
  "serde_json",
-]
-
-[[package]]
-name = "mini-agent-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "minijinja",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "toml",
- "url",
- "which",
-]
-
-[[package]]
-name = "mini-agent-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "mini-agent-core",
- "serde",
- "serde_json",
- "syntect",
- "unicode-width",
+ "viridian-mini-core",
+ "viridian-mini-tui",
 ]
 
 [[package]]
@@ -1751,6 +1720,49 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "viridian-mini"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde_json",
+ "viridian-mini-core",
+ "viridian-mini-tui",
+]
+
+[[package]]
+name = "viridian-mini-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "minijinja",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+ "url",
+ "which",
+]
+
+[[package]]
+name = "viridian-mini-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "serde",
+ "serde_json",
+ "syntect",
+ "unicode-width",
+ "viridian-mini-core",
+]
 
 [[package]]
 name = "walkdir"

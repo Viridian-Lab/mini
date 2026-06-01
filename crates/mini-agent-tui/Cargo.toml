@@ -1,13 +1,15 @@
 [package]
-name = "mini-agent-tui"
+name = "viridian-mini-tui"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+description.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1.0.98"
 crossterm = "0.29.0"
-mini-agent-core = { path = "../mini-agent-core" }
+mini-agent-core = { package = "viridian-mini-core", path = "../mini-agent-core", version = "0.1.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 syntect = "5.3.0"

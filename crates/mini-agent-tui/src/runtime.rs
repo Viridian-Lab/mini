@@ -72,6 +72,8 @@ pub fn run(options: RunOptions) -> Result<()> {
         streaming_committed_rows: 0,
         stream_final_skip_rows: None,
         previous_bottom_rows: 0,
+        rendered_width: None,
+        needs_full_redraw: false,
         running_since: None,
         session_id: session_id.clone(),
         session_title,
@@ -85,8 +87,8 @@ pub fn run(options: RunOptions) -> Result<()> {
     };
     save_session(&mut app)?;
 
-    let (width, _) = terminal::size().unwrap_or((80, 24));
-    for row in startup_banner_rows(&app, width.max(32)) {
+    let width = terminal_width();
+    for row in startup_banner_rows(&app, width) {
         write!(stdout, "{row}\r\n")?;
     }
     write!(stdout, "\r\n")?;
@@ -96,15 +98,20 @@ pub fn run(options: RunOptions) -> Result<()> {
         let until = app.messages.len();
         print_new_messages(&mut stdout, &mut app, content_width, width as usize, until)?;
     }
+    app.rendered_width = Some(width);
     stdout.flush()?;
 
     loop {
         let mut disconnected = false;
-        if let Some(receiver) = app.running.take() {
+        if let Some(running) = app.running.take() {
             let mut keep_running = true;
             loop {
-                match receiver.try_recv() {
-                    Ok(AgentUpdate::Event(event)) => handle_agent_event(&mut app, event),
+                match running.receiver.try_recv() {
+                    Ok(AgentUpdate::Event(event)) => {
+                        if !running.interrupted.load(Ordering::Relaxed) {
+                            handle_agent_event(&mut app, event);
+                        }
+                    }
                     Ok(AgentUpdate::Done(agent, Ok(()))) => {
                         app.agent = Some(*agent);
                         app.running_since = None;
@@ -113,14 +120,23 @@ pub fn run(options: RunOptions) -> Result<()> {
                         break;
                     }
                     Ok(AgentUpdate::Done(agent, Err(err))) => {
-                        finish_streaming(&mut app);
                         app.agent = Some(*agent);
                         app.running_since = None;
-                        app.messages.push(Message {
-                            role: Role::Local,
-                            text: err.to_string(),
-                            output: None,
-                        });
+                        if running.interrupted.load(Ordering::Relaxed) {
+                            discard_streaming(&mut app);
+                            app.messages.push(Message {
+                                role: Role::Local,
+                                text: "model interrupted".to_string(),
+                                output: None,
+                            });
+                        } else {
+                            finish_streaming(&mut app);
+                            app.messages.push(Message {
+                                role: Role::Local,
+                                text: err.to_string(),
+                                output: None,
+                            });
+                        }
                         save_session(&mut app)?;
                         keep_running = false;
                         break;
@@ -134,7 +150,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 }
             }
             if keep_running {
-                app.running = Some(receiver);
+                app.running = Some(running);
             }
         }
         if disconnected {
@@ -165,12 +181,13 @@ pub fn run(options: RunOptions) -> Result<()> {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             }) => {
-                if matches!(
-                    (code, modifiers),
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                        | (KeyCode::Char('d'), KeyModifiers::CONTROL)
-                ) {
+                if matches!((code, modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
                     break;
+                }
+
+                if matches!(code, KeyCode::Esc) && app.running.is_some() {
+                    interrupt_running_model(&mut app);
+                    continue;
                 }
 
                 if app.selection.is_some() {
@@ -263,7 +280,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 }
 
                 match (code, modifiers) {
-                    (KeyCode::Esc, _) => break,
+                    (KeyCode::Esc, _) => {}
                     (KeyCode::Enter, _) => {
                         if app.running.is_some() {
                             continue;
@@ -293,6 +310,8 @@ pub fn run(options: RunOptions) -> Result<()> {
                             output: None,
                         });
                         let (sender, receiver) = mpsc::channel();
+                        let interrupted = Arc::new(AtomicBool::new(false));
+                        let thread_interrupted = interrupted.clone();
                         let mut agent = app.agent.take().context("agent is already running")?;
                         let mut context_messages = agent.messages.clone();
                         context_messages.push(ModelMessage {
@@ -310,13 +329,20 @@ pub fn run(options: RunOptions) -> Result<()> {
                         thread::spawn(move || {
                             let event_sender = sender.clone();
                             let result = agent
-                                .run_with_events(prompt, |event| {
-                                    let _ = event_sender.send(AgentUpdate::Event(event));
-                                })
+                                .run_with_events_interruptible(
+                                    prompt,
+                                    |event| {
+                                        let _ = event_sender.send(AgentUpdate::Event(event));
+                                    },
+                                    Some(thread_interrupted),
+                                )
                                 .map(|_| ());
                             let _ = sender.send(AgentUpdate::Done(Box::new(agent), result));
                         });
-                        app.running = Some(receiver);
+                        app.running = Some(RunningAgent {
+                            receiver,
+                            interrupted,
+                        });
                         app.running_since = Some(Instant::now());
                     }
                     (KeyCode::Backspace, _) if app.cursor > 0 => {
@@ -378,16 +404,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 sync_command_palette(&mut app);
             }
             Event::Resize(_, _) => {
-                if app.previous_bottom_rows > 0 {
-                    queue!(
-                        stdout,
-                        cursor::MoveUp(app.previous_bottom_rows),
-                        cursor::MoveToColumn(0),
-                        terminal::Clear(terminal::ClearType::FromCursorDown)
-                    )?;
-                }
-                app.previous_bottom_rows = 0;
-                stdout.flush()?;
+                app.needs_full_redraw = true;
             }
             _ => {}
         }
@@ -397,6 +414,30 @@ pub fn run(options: RunOptions) -> Result<()> {
     write!(stdout, "\r\n")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn interrupt_running_model(app: &mut App) {
+    let Some(running) = &app.running else {
+        return;
+    };
+    if !running.interrupted.swap(true, Ordering::Relaxed) {
+        app.selection = None;
+        discard_streaming(app);
+        app.messages.push(Message {
+            role: Role::Local,
+            text: "interrupting model…".to_string(),
+            output: None,
+        });
+    }
+}
+
+fn discard_streaming(app: &mut App) {
+    app.streaming_text.clear();
+    app.streaming_started = false;
+    app.stream_message_cutoff = None;
+    app.stream_final_skip_rows = None;
+    app.streaming_rows.clear();
+    app.streaming_committed_rows = 0;
 }
 
 fn finish_streaming(app: &mut App) {

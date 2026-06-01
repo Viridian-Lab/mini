@@ -5,6 +5,8 @@ use crate::{
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn call_model(
     system: &str,
@@ -12,7 +14,17 @@ pub(crate) fn call_model(
     messages: &[ModelMessage],
     on_delta: impl FnMut(&str),
 ) -> Result<ModelResponse> {
-    call_model_with_body(system, config, messages, true, on_delta)
+    call_model_interruptible(system, config, messages, on_delta, None)
+}
+
+pub(crate) fn call_model_interruptible(
+    system: &str,
+    config: &Config,
+    messages: &[ModelMessage],
+    on_delta: impl FnMut(&str),
+    interrupted: Option<Arc<AtomicBool>>,
+) -> Result<ModelResponse> {
+    call_model_with_body(system, config, messages, true, on_delta, interrupted)
 }
 
 pub(crate) fn call_model_without_tools(
@@ -20,7 +32,7 @@ pub(crate) fn call_model_without_tools(
     config: &Config,
     messages: &[ModelMessage],
 ) -> Result<ModelResponse> {
-    call_model_with_body(system, config, messages, false, |_| {})
+    call_model_with_body(system, config, messages, false, |_| {}, None)
 }
 
 fn call_model_with_body(
@@ -29,6 +41,7 @@ fn call_model_with_body(
     messages: &[ModelMessage],
     tools: bool,
     on_delta: impl FnMut(&str),
+    interrupted: Option<Arc<AtomicBool>>,
 ) -> Result<ModelResponse> {
     let provider = config.model.provider(&config.providers)?;
     let (token, chatgpt_account_id) = auth_token(&provider)?;
@@ -45,19 +58,41 @@ fn call_model_with_body(
         builder = builder.header(name, value);
     }
 
+    if interrupted
+        .as_ref()
+        .is_some_and(|interrupted| interrupted.load(Ordering::Relaxed))
+    {
+        anyhow::bail!("model request interrupted");
+    }
+
     let response = builder.send().context("model request failed")?;
     let status = response.status();
     if !status.is_success() {
+        if interrupted
+            .as_ref()
+            .is_some_and(|interrupted| interrupted.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("model request interrupted");
+        }
+
         let response_text = response.text().context("failed to read model response")?;
         anyhow::bail!("model request failed with status {status}: {response_text}");
     }
 
     if provider.protocol != ModelProtocol::Gemini {
-        let response = streamed_assistant_response(provider.protocol, response, on_delta)?;
+        let response =
+            streamed_assistant_response(provider.protocol, response, on_delta, interrupted)?;
         if !tools && !response.tool_calls.is_empty() {
             anyhow::bail!("model returned tool calls during no-tools request");
         }
         return Ok(response);
+    }
+
+    if interrupted
+        .as_ref()
+        .is_some_and(|interrupted| interrupted.load(Ordering::Relaxed))
+    {
+        anyhow::bail!("model request interrupted");
     }
 
     let response_text = response.text().context("failed to read model response")?;
@@ -89,6 +124,7 @@ fn streamed_assistant_response(
     protocol: ModelProtocol,
     response: reqwest::blocking::Response,
     mut on_delta: impl FnMut(&str),
+    interrupted: Option<Arc<AtomicBool>>,
 ) -> Result<ModelResponse> {
     let mut assistant = String::new();
     let mut final_response = None;
@@ -225,7 +261,13 @@ fn streamed_assistant_response(
         };
 
         for line in BufReader::new(response).lines() {
-            let line = line.context("failed to read model stream")?;
+            if interrupted
+                .as_ref()
+                .is_some_and(|interrupted| interrupted.load(Ordering::Relaxed))
+            {
+                anyhow::bail!("model request interrupted");
+            }
+            let line = line.map_err(|err| anyhow::anyhow!("failed to read model stream: {err}"))?;
             if line.is_empty() {
                 if handle_data(&data)? {
                     break;

@@ -146,7 +146,9 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ModelToolCall>,
 }
 
-pub(crate) use crate::model_transport::{call_model, call_model_without_tools};
+pub(crate) use crate::model_transport::{
+    call_model, call_model_interruptible, call_model_without_tools,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]

@@ -22,27 +22,18 @@ model = "gpt-5.5"
 "#;
 
 const DEFAULT_MODES: &[(&str, &str)] = &[
-    (
-        "default.md",
-        include_str!("../../../examples/modes/default.md"),
-    ),
-    ("shell.md", include_str!("../../../examples/modes/shell.md")),
-    (
-        "review.md",
-        include_str!("../../../examples/modes/review.md"),
-    ),
+    ("default.md", include_str!("../assets/modes/default.md")),
+    ("shell.md", include_str!("../assets/modes/shell.md")),
+    ("review.md", include_str!("../assets/modes/review.md")),
 ];
 
 pub const DEFAULT_PLUGINS: &[(&str, &str)] = &[
-    ("jj.md", include_str!("../../../examples/plugins/jj.md")),
+    ("jj.md", include_str!("../assets/plugins/jj.md")),
     (
         "subagents.md",
-        include_str!("../../../examples/plugins/subagents.md"),
+        include_str!("../assets/plugins/subagents.md"),
     ),
-    (
-        "memories.md",
-        include_str!("../../../examples/plugins/memories.md"),
-    ),
+    ("memories.md", include_str!("../assets/plugins/memories.md")),
 ];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

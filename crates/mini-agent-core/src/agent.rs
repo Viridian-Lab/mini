@@ -1,10 +1,12 @@
 use crate::{
     Config, ModelMessage, ModelRole, ModelSyntheticKind, ModelToolResult,
-    model::{call_model, call_model_without_tools},
+    model::{call_model, call_model_interruptible, call_model_without_tools},
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 
@@ -59,7 +61,16 @@ impl Agent {
     pub fn run_with_events(
         &mut self,
         user_prompt: impl Into<String>,
+        emit: impl FnMut(AgentEvent),
+    ) -> Result<AgentRun> {
+        self.run_with_events_interruptible(user_prompt, emit, None)
+    }
+
+    pub fn run_with_events_interruptible(
+        &mut self,
+        user_prompt: impl Into<String>,
         mut emit: impl FnMut(AgentEvent),
+        interrupted: Option<Arc<AtomicBool>>,
     ) -> Result<AgentRun> {
         self.messages.push(ModelMessage {
             role: ModelRole::User,
@@ -72,10 +83,25 @@ impl Agent {
         let mut turns = 0usize;
         loop {
             turns = turns.saturating_add(1);
+            self.bail_if_interrupted(&interrupted)?;
             self.compact_if_needed(&mut emit)?;
-            let response = call_model(&self.system, &self.config, &self.messages, |delta| {
-                emit(AgentEvent::AssistantDelta(delta.to_string()));
-            })?;
+            self.bail_if_interrupted(&interrupted)?;
+            let response = if interrupted.is_some() {
+                call_model_interruptible(
+                    &self.system,
+                    &self.config,
+                    &self.messages,
+                    |delta: &str| {
+                        emit(AgentEvent::AssistantDelta(delta.to_string()));
+                    },
+                    interrupted.clone(),
+                )?
+            } else {
+                call_model(&self.system, &self.config, &self.messages, |delta| {
+                    emit(AgentEvent::AssistantDelta(delta.to_string()));
+                })?
+            };
+            self.bail_if_interrupted(&interrupted)?;
             self.messages.push(ModelMessage {
                 role: ModelRole::Assistant,
                 text: response.text.clone(),
@@ -107,8 +133,10 @@ impl Agent {
                 if command.trim().is_empty() {
                     anyhow::bail!("bash tool call command is empty");
                 }
+                self.bail_if_interrupted(&interrupted)?;
                 let command = command.to_string();
                 emit(AgentEvent::Command(command.clone()));
+                self.bail_if_interrupted(&interrupted)?;
 
                 let mut process = Command::new("bash");
                 process.arg("-lc").arg(&command);
@@ -116,6 +144,7 @@ impl Agent {
                     process.env("PATH", path);
                 }
                 let raw_output = process.output().context("failed to run bash command")?;
+                self.bail_if_interrupted(&interrupted)?;
                 let output = CommandOutput {
                     status: raw_output.status.code(),
                     stdout: String::from_utf8_lossy(&raw_output.stdout).to_string(),
@@ -162,6 +191,16 @@ impl Agent {
                 });
             }
         }
+    }
+
+    fn bail_if_interrupted(&self, interrupted: &Option<Arc<AtomicBool>>) -> Result<()> {
+        if interrupted
+            .as_ref()
+            .is_some_and(|interrupted| interrupted.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("model request interrupted");
+        }
+        Ok(())
     }
 
     fn compact_if_needed(&mut self, emit: &mut impl FnMut(AgentEvent)) -> Result<()> {

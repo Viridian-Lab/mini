@@ -9,7 +9,9 @@ use mini_agent_core::{
 use serde::{Deserialize, Serialize};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -73,6 +75,11 @@ const SLASH_COMMANDS: [&str; 10] = [
 enum AgentUpdate {
     Event(AgentEvent),
     Done(Box<Agent>, Result<()>),
+}
+
+struct RunningAgent {
+    receiver: Receiver<AgentUpdate>,
+    interrupted: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,6 +151,8 @@ struct App {
     streaming_committed_rows: usize,
     stream_final_skip_rows: Option<usize>,
     previous_bottom_rows: u16,
+    rendered_width: Option<u16>,
+    needs_full_redraw: bool,
     running_since: Option<Instant>,
     session_id: String,
     session_title: Option<String>,
@@ -153,7 +162,7 @@ struct App {
     append_system_prompt: Option<String>,
     ignore_plugin_errors: bool,
     agent: Option<Agent>,
-    running: Option<Receiver<AgentUpdate>>,
+    running: Option<RunningAgent>,
 }
 
 pub struct RunOptions {

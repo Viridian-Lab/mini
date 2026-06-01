@@ -18,15 +18,26 @@ Markdown plugins that can install helper scripts.
 
 ## Quick start
 
+Install from crates.io:
+
 ```sh
-cargo run -p mini-agent-cli
+cargo install viridian-mini
 ```
 
-The built binary is named `mini`:
+The installed binary is named `mini`:
 
 ```sh
+mini
+mini -p "summarize this repository"
+mini --help
+```
+
+For development, install or run from a checkout:
+
+```sh
+cargo install --path .
+cargo run -p mini-agent-cli
 cargo run -p mini-agent-cli -- -p "summarize this repository"
-cargo run -p mini-agent-cli -- --help
 ```
 
 On first startup, `mini` creates editable defaults if they do not exist:

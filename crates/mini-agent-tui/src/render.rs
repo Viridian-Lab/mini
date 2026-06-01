@@ -27,13 +27,6 @@ fn startup_banner_rows(app: &App, max_width: u16) -> Vec<String> {
                 .unwrap_or_else(|| format!("{} active", app.plugins.len())),
         ),
         ("workspace", workspace),
-        (
-            "session",
-            app.session_title
-                .as_deref()
-                .map(|title| format!("{} — {title}", app.session_id))
-                .unwrap_or_else(|| app.session_id.clone()),
-        ),
         ("model", app.model.clone()),
         ("mode", app.mode.clone()),
     ];
@@ -127,17 +120,37 @@ fn startup_banner_rows(app: &App, max_width: u16) -> Vec<String> {
 }
 
 fn render(stdout: &mut Stdout, app: &mut App) -> Result<u16> {
-    if app.previous_bottom_rows > 0 {
-        queue!(stdout, cursor::MoveUp(app.previous_bottom_rows))?;
-    }
-    queue!(
-        stdout,
-        cursor::MoveToColumn(0),
-        terminal::Clear(terminal::ClearType::FromCursorDown)
-    )?;
+    let width = terminal_width();
+    let full_redraw = app.needs_full_redraw || app.rendered_width.is_some_and(|old| old != width);
+    app.needs_full_redraw = false;
+    app.rendered_width = Some(width);
 
-    let (width, _) = terminal::size().unwrap_or((80, 24));
-    let width = width.max(32);
+    if full_redraw {
+        app.previous_bottom_rows = 0;
+        app.printed_messages = 0;
+        app.streaming_rows.clear();
+        app.streaming_committed_rows = 0;
+        app.stream_final_skip_rows = None;
+        queue!(
+            stdout,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(terminal::ClearType::All)
+        )?;
+        for row in startup_banner_rows(app, width) {
+            write!(stdout, "{row}\r\n")?;
+        }
+        write!(stdout, "\r\n")?;
+    } else {
+        if app.previous_bottom_rows > 0 {
+            queue!(stdout, cursor::MoveUp(app.previous_bottom_rows))?;
+        }
+        queue!(
+            stdout,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )?;
+    }
+
     let content_width = width.saturating_sub(4) as usize;
 
     let stream_message_cutoff = app.stream_message_cutoff.unwrap_or(app.messages.len());
@@ -433,4 +446,11 @@ fn context_percent_for(
     }
     let estimated = estimate_messages_tokens(system, messages);
     ((estimated as f64 / context_window_tokens as f64) * 100.0).round() as usize
+}
+
+fn terminal_width() -> u16 {
+    terminal::size()
+        .map(|(width, _)| width)
+        .unwrap_or(80)
+        .max(4)
 }
