@@ -36,7 +36,7 @@ pub const DEFAULT_PLUGINS: &[(&str, &str)] = &[
     ("memories.md", include_str!("../assets/plugins/memories.md")),
 ];
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
@@ -44,6 +44,23 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(skip, default = "default_app_dir_name")]
+    pub app_dir_name: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            agent: AgentConfig::default(),
+            model: ModelConfig::default(),
+            providers: BTreeMap::new(),
+            app_dir_name: default_app_dir_name(),
+        }
+    }
+}
+
+fn default_app_dir_name() -> String {
+    ".mini-agent".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,17 +91,27 @@ impl Default for AgentConfig {
 
 impl Config {
     pub fn load_default() -> anyhow::Result<Self> {
-        let Some(paths) = Self::ensure_user_files()? else {
+        Self::load_from_app(".mini-agent")
+    }
+
+    pub fn load_from_app(app_dir_name: &str) -> anyhow::Result<Self> {
+        let Some(paths) = Self::ensure_app_files(app_dir_name)? else {
             return Ok(Self::default());
         };
 
         let source = std::fs::read_to_string(&paths.config_file)?;
-        Ok(toml::from_str(&source)?)
+        let mut config: Self = toml::from_str(&source)?;
+        config.app_dir_name = app_dir_name.to_string();
+        Ok(config)
     }
 
     pub fn save_default(&self) -> anyhow::Result<()> {
-        let Some(paths) = Self::ensure_user_files()? else {
-            anyhow::bail!("HOME is not set, so ~/.mini-agent/config.toml cannot be updated");
+        self.save_for_app(".mini-agent")
+    }
+
+    pub fn save_for_app(&self, app_dir_name: &str) -> anyhow::Result<()> {
+        let Some(paths) = Self::ensure_app_files(app_dir_name)? else {
+            anyhow::bail!("HOME is not set, so {app_dir_name}/config.toml cannot be updated");
         };
         std::fs::write(&paths.config_file, toml::to_string_pretty(self)?)
             .with_context(|| format!("failed to write '{}'", paths.config_file.display()))?;
@@ -92,20 +119,29 @@ impl Config {
     }
 
     pub fn user_paths() -> Option<ConfigPaths> {
+        Self::app_paths(".mini-agent")
+    }
+
+    pub fn app_paths(app_dir_name: &str) -> Option<ConfigPaths> {
         let home = std::env::var_os("HOME")?;
-        let root = PathBuf::from(home).join(".mini-agent");
+        let root = PathBuf::from(home).join(app_dir_name);
         Some(ConfigPaths {
             config_file: root.join("config.toml"),
             modes_dir: root.join("modes"),
             plugins_dir: root.join("plugins"),
             bin_dir: root.join("bin"),
             state_dir: root.join("state"),
+            app_dir_name: app_dir_name.to_string(),
             root,
         })
     }
 
     pub fn ensure_user_files() -> anyhow::Result<Option<ConfigPaths>> {
-        let Some(paths) = Self::user_paths() else {
+        Self::ensure_app_files(".mini-agent")
+    }
+
+    pub fn ensure_app_files(app_dir_name: &str) -> anyhow::Result<Option<ConfigPaths>> {
+        let Some(paths) = Self::app_paths(app_dir_name) else {
             return Ok(None);
         };
 
@@ -135,11 +171,23 @@ impl Config {
     }
 
     pub fn mode_file(id: &str) -> Option<PathBuf> {
-        Some(Self::user_paths()?.modes_dir.join(format!("{id}.md")))
+        Some(Self::mode_file_for_app(".mini-agent", id)?)
+    }
+
+    pub fn mode_file_for_app(app_dir_name: &str, id: &str) -> Option<PathBuf> {
+        Some(
+            Self::app_paths(app_dir_name)?
+                .modes_dir
+                .join(format!("{id}.md")),
+        )
     }
 
     pub fn path_with_bin() -> Option<OsString> {
-        let paths = Self::user_paths()?;
+        Self::path_with_app_bin(".mini-agent")
+    }
+
+    pub fn path_with_app_bin(app_dir_name: &str) -> Option<OsString> {
+        let paths = Self::app_paths(app_dir_name)?;
         let mut path = vec![paths.bin_dir];
         if let Some(current) = std::env::var_os("PATH") {
             path.extend(std::env::split_paths(&current));
@@ -156,4 +204,5 @@ pub struct ConfigPaths {
     pub plugins_dir: PathBuf,
     pub bin_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub app_dir_name: String,
 }

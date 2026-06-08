@@ -31,6 +31,7 @@ members = [
     "crates/mini-agent-cli",
     "crates/mini-agent-core",
     "crates/mini-agent-tui",
+    "crates/miniscient",
 ]
 resolver = "2"
 

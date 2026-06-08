@@ -140,8 +140,14 @@ impl Agent {
 
                 let mut process = Command::new("bash");
                 process.arg("-lc").arg(&command);
-                if let Some(path) = Config::path_with_bin() {
+                if let Some(path) = Config::path_with_app_bin(&self.config.app_dir_name) {
                     process.env("PATH", path);
+                    process.env(
+                        "MINI_AGENT_HOME",
+                        Config::app_paths(&self.config.app_dir_name)
+                            .map(|paths| paths.root)
+                            .unwrap_or_default(),
+                    );
                 }
                 let raw_output = process.output().context("failed to run bash command")?;
                 self.bail_if_interrupted(&interrupted)?;

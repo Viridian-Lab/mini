@@ -44,7 +44,7 @@ fn call_model_with_body(
     interrupted: Option<Arc<AtomicBool>>,
 ) -> Result<ModelResponse> {
     let provider = config.model.provider(&config.providers)?;
-    let (token, chatgpt_account_id) = auth_token(&provider)?;
+    let (token, chatgpt_account_id) = auth_token(config, &provider)?;
     let body = if tools {
         request_body(_system, messages, &config.model, &provider)
     } else {

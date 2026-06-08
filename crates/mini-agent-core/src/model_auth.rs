@@ -47,7 +47,7 @@ impl Provider {
     }
 }
 
-pub fn auth_token(provider: &Provider) -> Result<(Option<String>, Option<String>)> {
+pub fn auth_token(config: &Config, provider: &Provider) -> Result<(Option<String>, Option<String>)> {
     match provider.auth {
         ModelAuth::ApiKey => {
             let api_key_env = provider
@@ -62,18 +62,27 @@ pub fn auth_token(provider: &Provider) -> Result<(Option<String>, Option<String>
             anyhow::bail!("missing API key environment variable {api_key_env}")
         }
         ModelAuth::CodexOauth => {
-            let auth = codex_auth()?.context("missing Codex OAuth token; run `mini auth login`")?;
-            let account_id = auth.account_id.context(
-                "Codex OAuth token did not include a ChatGPT account id; run `mini auth logout` then `mini auth login`",
-            )?;
+            let auth_command = if config.app_dir_name == ".miniscient" {
+                "miniscient"
+            } else {
+                "mini"
+            };
+            let auth = codex_auth_for_app(&config.app_dir_name)?.with_context(|| {
+                format!("missing Codex OAuth token; run `{auth_command} auth login`")
+            })?;
+            let account_id = auth.account_id.with_context(|| {
+                format!(
+                    "Codex OAuth token did not include a ChatGPT account id; run `{auth_command} auth logout` then `{auth_command} auth login`"
+                )
+            })?;
             Ok((Some(auth.access_token), Some(account_id)))
         }
         ModelAuth::None => Ok((None, None)),
     }
 }
 
-fn model_list_response(provider: &Provider, url: &str) -> Result<Value> {
-    let (token, chatgpt_account_id) = auth_token(provider)?;
+fn model_list_response(config: &Config, provider: &Provider, url: &str) -> Result<Value> {
+    let (token, chatgpt_account_id) = auth_token(config, provider)?;
     let client = reqwest::blocking::Client::new();
     let mut builder = client.get(url);
     for (name, value) in provider.headers(token.as_deref(), chatgpt_account_id.as_deref()) {

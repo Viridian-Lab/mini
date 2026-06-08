@@ -789,6 +789,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniscient"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "viridian-mini-core",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

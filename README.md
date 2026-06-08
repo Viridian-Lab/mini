@@ -130,6 +130,64 @@ mini --ignore --check-plugins --plugin examples/plugins/jj.md
 `--ignore` skips supported non-fatal plugin load/render errors. `--yolo`
 answers yes to confirmations.
 
+
+## Miniscient server
+
+`miniscient` is an always-on local server that reuses `mini-agent-core` but keeps
+its own home directory under `~/.miniscient`. It is intended for out-of-process
+connectors such as SMS listeners, Telegram bots, or other small bridge programs.
+Those connectors can call the local HTTP interface instead of embedding agent
+logic.
+
+Start the server:
+
+```sh
+cargo run -p miniscient -- serve --listen 127.0.0.1:47873
+```
+
+If you use the Codex provider, authenticate separately for `~/.miniscient`:
+
+```sh
+cargo run -p miniscient -- auth login
+```
+
+Example connector request:
+
+```sh
+curl -s http://127.0.0.1:47873/message \
+  -H 'content-type: application/json' \
+  -d '{"type":"message","text":"what should I do next?"}'
+```
+
+Useful endpoints:
+
+- `GET /health`
+- `GET /status`
+- `GET /history`
+- `POST /message` with `{"type":"message","text":"..."}`
+- `POST /reload`
+- `POST /clear`
+- `POST /rpc` with any request object
+
+Responses are JSON envelopes with `ok`, `result`, and `error` fields. Message
+responses include the final assistant text plus structured events for assistant
+deltas, tool use/results, and compaction.
+
+### iMessage adapter
+
+An example macOS iMessage connector lives at
+`examples/adapters/miniscient-imessage.sh`. It polls the local Messages database,
+forwards allowed inbound messages to `miniscient`, and replies through Messages
+using AppleScript.
+
+```sh
+examples/adapters/miniscient-imessage.sh --allow +15551234567
+```
+
+The adapter requires Full Disk Access for the process that runs it so it can
+read `~/Library/Messages/chat.db`, and Automation permission to control
+Messages. Use `--print-only` to test without sending replies.
+
 ## Configuration
 
 Main config lives at `~/.mini-agent/config.toml`:

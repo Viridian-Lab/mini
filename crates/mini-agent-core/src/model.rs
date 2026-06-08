@@ -1,4 +1,4 @@
-use crate::auth::codex_auth;
+use crate::{Config, auth::codex_auth_for_app};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

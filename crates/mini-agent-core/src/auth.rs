@@ -55,7 +55,11 @@ struct TokenResponse {
 }
 
 pub fn auth_status() -> Result<Option<StoredAuth>> {
-    let Some(paths) = Config::user_paths() else {
+    auth_status_for_app(".mini-agent")
+}
+
+pub fn auth_status_for_app(app_dir_name: &str) -> Result<Option<StoredAuth>> {
+    let Some(paths) = Config::app_paths(app_dir_name) else {
         return Ok(None);
     };
     let path = paths.root.join("auth.json");
@@ -66,7 +70,11 @@ pub fn auth_status() -> Result<Option<StoredAuth>> {
 }
 
 pub fn logout() -> Result<()> {
-    let Some(paths) = Config::user_paths() else {
+    logout_for_app(".mini-agent")
+}
+
+pub fn logout_for_app(app_dir_name: &str) -> Result<()> {
+    let Some(paths) = Config::app_paths(app_dir_name) else {
         return Ok(());
     };
     let path = paths.root.join("auth.json");
@@ -77,6 +85,10 @@ pub fn logout() -> Result<()> {
 }
 
 pub fn oauth_login(show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
+    oauth_login_for_app(".mini-agent", show_url)
+}
+
+pub fn oauth_login_for_app(app_dir_name: &str, show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
     let listener = TcpListener::bind(("127.0.0.1", OPENAI_CODEX_REDIRECT_PORT)).with_context(
         || format!("failed to start localhost OAuth callback listener on port {OPENAI_CODEX_REDIRECT_PORT}"),
     )?;
@@ -137,12 +149,16 @@ pub fn oauth_login(show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
         auth_mode: "codex-oauth".to_string(),
         tokens: token,
     };
-    save_auth(&auth)?;
+    save_auth(app_dir_name, &auth)?;
     Ok(auth)
 }
 
 pub fn codex_auth() -> Result<Option<AuthTokens>> {
-    let Some(mut auth) = auth_status()? else {
+    codex_auth_for_app(".mini-agent")
+}
+
+pub fn codex_auth_for_app(app_dir_name: &str) -> Result<Option<AuthTokens>> {
+    let Some(mut auth) = auth_status_for_app(app_dir_name)? else {
         return Ok(None);
     };
 
@@ -169,7 +185,7 @@ pub fn codex_auth() -> Result<Option<AuthTokens>> {
     }
 
     if changed {
-        save_auth(&auth)?;
+        save_auth(app_dir_name, &auth)?;
     }
 
     Ok(Some(auth.tokens))
@@ -226,8 +242,8 @@ fn chatgpt_account_id(access_token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn save_auth(auth: &StoredAuth) -> Result<()> {
-    let paths = Config::ensure_user_files()?.context("HOME is not set")?;
+fn save_auth(app_dir_name: &str, auth: &StoredAuth) -> Result<()> {
+    let paths = Config::ensure_app_files(app_dir_name)?.context("HOME is not set")?;
     let path = paths.root.join("auth.json");
     std::fs::write(&path, serde_json::to_string_pretty(auth)?)
         .with_context(|| format!("failed to write '{}'", path.display()))?;

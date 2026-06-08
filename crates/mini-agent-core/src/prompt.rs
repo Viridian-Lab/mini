@@ -13,6 +13,26 @@ pub fn compose_prompt(
     append_system_prompt: Option<&str>,
     ignore_plugin_errors: bool,
 ) -> Result<String> {
+    compose_prompt_for_app(
+        ".mini-agent",
+        system_prompt,
+        mode,
+        plugins,
+        cwd,
+        append_system_prompt,
+        ignore_plugin_errors,
+    )
+}
+
+pub fn compose_prompt_for_app(
+    app_dir_name: &str,
+    system_prompt: &str,
+    mode: Option<&Plugin>,
+    plugins: &[Plugin],
+    cwd: &Path,
+    append_system_prompt: Option<&str>,
+    ignore_plugin_errors: bool,
+) -> Result<String> {
     let active_plugins = active_plugin_id_set(plugins);
 
     let system_prompt = match mode {
@@ -20,7 +40,7 @@ pub fn compose_prompt(
             if mode.kind != PluginKind::Mode {
                 anyhow::bail!("plugin '{}' is not a mode", mode.id);
             }
-            mode.render(cwd, &active_plugins)?
+            mode.render_for_app(app_dir_name, cwd, &active_plugins)?
         }
         None => system_prompt.to_string(),
     };
@@ -30,7 +50,7 @@ pub fn compose_prompt(
         if plugin.kind != PluginKind::Plugin {
             anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
         }
-        match plugin.render(cwd, &active_plugins) {
+        match plugin.render_for_app(app_dir_name, cwd, &active_plugins) {
             Ok(prompt) => parts.push(prompt),
             Err(_) if ignore_plugin_errors => {}
             Err(err) => return Err(err.into()),

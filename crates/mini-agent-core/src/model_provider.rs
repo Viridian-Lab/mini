@@ -112,6 +112,24 @@ pub fn list_models(
     config: &ModelConfig,
     providers: &BTreeMap<String, ProviderConfig>,
 ) -> Result<Vec<String>> {
+    list_models_for_app(".mini-agent", config, providers)
+}
+
+pub fn list_models_for_config(config: &Config) -> Result<Vec<String>> {
+    list_models_for_app(&config.app_dir_name, &config.model, &config.providers)
+}
+
+pub fn list_models_for_app(
+    app_dir_name: &str,
+    config: &ModelConfig,
+    providers: &BTreeMap<String, ProviderConfig>,
+) -> Result<Vec<String>> {
+    let auth_config = Config {
+        agent: Default::default(),
+        model: config.clone(),
+        providers: providers.clone(),
+        app_dir_name: app_dir_name.to_string(),
+    };
     let provider = config.provider(providers)?;
     let base_url = provider
         .base_url
@@ -163,7 +181,7 @@ pub fn list_models(
                     });
                     url.push_str(client_version);
                 }
-                let response = model_list_response(&provider, &url)?;
+                let response = model_list_response(&auth_config, &provider, &url)?;
                 let source = response["data"]
                     .as_array()
                     .or_else(|| response["models"].as_array())
@@ -199,7 +217,7 @@ pub fn list_models(
                     if let Some(after_id) = &after_id {
                         url.query_pairs_mut().append_pair("after_id", after_id);
                     }
-                    let response = model_list_response(&provider, url.as_str())?;
+                    let response = model_list_response(&auth_config, &provider, url.as_str())?;
                     if let Some(data) = response["data"].as_array() {
                         for model in data {
                             if let Some(id) = model["id"].as_str() {
@@ -233,7 +251,7 @@ pub fn list_models(
                     if let Some(page_token) = &page_token {
                         url.query_pairs_mut().append_pair("pageToken", page_token);
                     }
-                    let response = model_list_response(&provider, url.as_str())?;
+                    let response = model_list_response(&auth_config, &provider, url.as_str())?;
                     if let Some(data) = response["models"].as_array() {
                         for model in data {
                             if let Some(methods) = model["supportedGenerationMethods"].as_array()

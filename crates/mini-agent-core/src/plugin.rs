@@ -87,6 +87,10 @@ struct CommandProbe {
 }
 
 pub fn load_plugin(spec: impl AsRef<Path>) -> Result<Plugin> {
+    load_plugin_for_app(".mini-agent", spec)
+}
+
+pub fn load_plugin_for_app(app_dir_name: &str, spec: impl AsRef<Path>) -> Result<Plugin> {
     let path = spec.as_ref();
     if path.exists()
         || path.components().count() > 1
@@ -99,8 +103,8 @@ pub fn load_plugin(spec: impl AsRef<Path>) -> Result<Plugin> {
         anyhow::bail!("plugin spec '{}' is not UTF-8", path.display());
     };
 
-    let Some(paths) = Config::user_paths() else {
-        anyhow::bail!("HOME is not set, so plugin ids cannot be resolved from ~/.mini-agent");
+    let Some(paths) = Config::app_paths(app_dir_name) else {
+        anyhow::bail!("HOME is not set, so plugin ids cannot be resolved from ~/{app_dir_name}");
     };
     let mode_path = paths.modes_dir.join(format!("{spec}.md"));
     if mode_path.exists() {
@@ -125,6 +129,18 @@ pub fn active_plugin_ids(plugins: &[Plugin]) -> Vec<&str> {
 }
 
 pub fn install_scripts(
+    paths: &ConfigPaths,
+    mode: &Plugin,
+    plugins: &[Plugin],
+    cwd: &Path,
+    yolo: bool,
+    ignore: bool,
+) -> Result<()> {
+    install_scripts_for_app(".mini-agent", paths, mode, plugins, cwd, yolo, ignore)
+}
+
+pub fn install_scripts_for_app(
+    app_dir_name: &str,
     paths: &ConfigPaths,
     mode: &Plugin,
     plugins: &[Plugin],
@@ -168,8 +184,13 @@ pub fn install_scripts(
                     );
                 }
 
-                let mut content =
-                    plugin.render_template(&script.name, &script.content, cwd, &active_plugins)?;
+                let mut content = plugin.render_template(
+                    app_dir_name,
+                    &script.name,
+                    &script.content,
+                    cwd,
+                    &active_plugins,
+                )?;
                 if script.content.ends_with('\n') && !content.ends_with('\n') {
                     content.push('\n');
                 }
@@ -333,14 +354,24 @@ impl Plugin {
         cwd: &Path,
         active_plugins: &BTreeSet<String>,
     ) -> Result<String, PluginError> {
+        self.render_for_app(".mini-agent", cwd, active_plugins)
+    }
+
+    pub fn render_for_app(
+        &self,
+        app_dir_name: &str,
+        cwd: &Path,
+        active_plugins: &BTreeSet<String>,
+    ) -> Result<String, PluginError> {
         Ok(self
-            .render_template("plugin", &self.body, cwd, active_plugins)?
+            .render_template(app_dir_name, "plugin", &self.body, cwd, active_plugins)?
             .trim()
             .to_string())
     }
 
     fn render_template(
         &self,
+        app_dir_name: &str,
         name: &str,
         source: &str,
         cwd: &Path,
@@ -349,7 +380,7 @@ impl Plugin {
         let mut commands = Map::new();
         for (name, probe) in &self.commands {
             let exists = which::which(&probe.command).is_ok()
-                || Config::user_paths()
+                || Config::app_paths(app_dir_name)
                     .map(|paths| paths.bin_dir.join(&probe.command).is_file())
                     .unwrap_or(false);
             if probe.required && !exists {
