@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mini_agent_core::{
-    Agent, AgentEvent, Config, DEFAULT_PLUGINS, DEFAULT_SYSTEM_PROMPT, Plugin, PluginError,
-    PluginKind, active_plugin_ids, auth_status, check_plugins, compose_prompt, install_scripts,
-    load_plugin, logout, oauth_login,
+    Agent, AgentEvent, Config, DEFAULT_PLUGINS, DEFAULT_SYSTEM_PROMPT, Plugin, PluginKind,
+    active_plugin_ids, auth_status, check_plugins, compose_prompt, install_scripts,
+    load_active_plugins, load_plugin, logout, oauth_login,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
+
+/// `mini` stores its modes, plugins, config, and auth under `~/.mini-agent`.
+/// The core itself is identity-free; this binary owns the directory name.
+const APP_DIR: &str = ".mini-agent";
 
 #[derive(Debug, Parser)]
 #[command(name = "mini")]
@@ -119,12 +122,13 @@ fn main() -> Result<()> {
         return match command {
             Command::Auth { command } => match command {
                 AuthCommand::Login => {
-                    let auth = oauth_login(|url| eprintln!("Open this URL to sign in:\n{url}"))?;
+                    let auth =
+                        oauth_login(APP_DIR, |url| eprintln!("Open this URL to sign in:\n{url}"))?;
                     println!("logged in with {}", auth.auth_mode);
                     Ok(())
                 }
                 AuthCommand::Status => {
-                    if let Some(auth) = auth_status()? {
+                    if let Some(auth) = auth_status(APP_DIR)? {
                         println!("{}", auth.auth_mode);
                     } else {
                         println!("not logged in");
@@ -132,13 +136,13 @@ fn main() -> Result<()> {
                     Ok(())
                 }
                 AuthCommand::Logout => {
-                    logout()?;
+                    logout(APP_DIR)?;
                     println!("logged out");
                     Ok(())
                 }
             },
             Command::Plugin { command } => {
-                let paths = Config::ensure_user_files()?
+                let paths = Config::ensure_app_files(APP_DIR)?
                     .context("HOME is not set, so plugins cannot be managed")?;
                 match command {
                     PluginCommand::Add { url } => {
@@ -281,14 +285,15 @@ fn main() -> Result<()> {
     }
 
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let first_run = Config::user_paths().is_some_and(|paths| !paths.config_file.exists());
-    let mut config = Config::load_default().context("failed to load ~/.mini-agent/config.toml")?;
+    let first_run = Config::app_paths(APP_DIR).is_some_and(|paths| !paths.config_file.exists());
+    let mut config = Config::load_from_app(APP_DIR)
+        .with_context(|| format!("failed to load ~/{APP_DIR}/config.toml"))?;
     if first_run
         && !cli.print
         && io::stdin().is_terminal()
         && io::stderr().is_terminal()
         && confirm("Install and enable bundled plugins? [y/N] ")?
-        && let Some(paths) = Config::user_paths()
+        && let Some(paths) = Config::app_paths(APP_DIR)
     {
         for (file_name, source) in DEFAULT_PLUGINS {
             let path = paths.plugins_dir.join(file_name);
@@ -301,11 +306,11 @@ fn main() -> Result<()> {
                 config.agent.plugins.push(id.to_string());
             }
         }
-        config.save_default()?;
+        config.save()?;
     }
     if !first_run
         && config.agent.plugins.is_empty()
-        && let Some(paths) = Config::user_paths()
+        && let Some(paths) = Config::app_paths(APP_DIR)
     {
         let source = std::fs::read_to_string(&paths.config_file).unwrap_or_default();
         let has_plugins_key = source.lines().any(|line| {
@@ -321,71 +326,30 @@ fn main() -> Result<()> {
                 }
             }
             if !config.agent.plugins.is_empty() {
-                config.save_default()?;
+                config.save()?;
             }
         }
     }
     let mode_spec = cli.mode.as_deref().unwrap_or(&config.agent.default_mode);
-    let mode =
-        load_plugin(mode_spec).with_context(|| format!("failed to load mode '{mode_spec}'"))?;
+    let mode = load_plugin(APP_DIR, mode_spec)
+        .with_context(|| format!("failed to load mode '{mode_spec}'"))?;
     if mode.kind != PluginKind::Mode {
         anyhow::bail!("plugin '{}' is not a mode", mode.id);
     }
 
-    let mut plugins = Vec::new();
-    for spec in &config.agent.plugins {
-        let plugin =
-            match load_plugin(spec).with_context(|| format!("failed to load plugin '{spec}'")) {
-                Ok(plugin) => plugin,
-                Err(_) if cli.ignore => continue,
-                Err(err) => return Err(err),
-            };
-        if plugin.kind != PluginKind::Plugin {
-            if cli.ignore {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
+    let (plugins, skipped_plugins) = load_active_plugins(
+        APP_DIR,
+        &config.agent.plugins,
+        &cli.plugins,
+        &cwd,
+        cli.ignore,
+    )?;
+    for skipped in &skipped_plugins {
+        eprintln!("skipped plugin '{skipped}'");
     }
-    for path in &cli.plugins {
-        let plugin = match load_plugin(path)
-            .with_context(|| format!("failed to load plugin '{}'", path.display()))
-        {
-            Ok(plugin) => plugin,
-            Err(_) if cli.ignore => continue,
-            Err(err) => return Err(err),
-        };
-        if plugin.kind != PluginKind::Plugin {
-            if cli.ignore {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
-    }
-    plugins.sort_by(|left, right| left.id.cmp(&right.id));
-    plugins.dedup_by(|left, right| left.id == right.id);
 
-    let active_plugins = plugins
-        .iter()
-        .map(|plugin| plugin.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut available_plugins = Vec::new();
-    for plugin in plugins {
-        match plugin.render(&cwd, &active_plugins) {
-            Ok(_) => available_plugins.push(plugin),
-            Err(err @ PluginError::MissingCommand { .. }) => {
-                eprintln!("skipped plugin '{}': {err}", plugin.id);
-            }
-            Err(_) if cli.ignore => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    let plugins = available_plugins;
-
-    if let Some(paths) = Config::user_paths() {
-        install_scripts(&paths, &mode, &plugins, &cwd, cli.yolo, cli.ignore)?;
+    if let Some(paths) = Config::app_paths(APP_DIR) {
+        install_scripts(APP_DIR, &paths, &mode, &plugins, &cwd, cli.yolo, cli.ignore)?;
     } else if !mode.scripts.is_empty() || plugins.iter().any(|plugin| !plugin.scripts.is_empty()) {
         anyhow::bail!(
             "HOME is not set, so plugin scripts cannot be installed under ~/.mini-agent/bin"
@@ -393,7 +357,7 @@ fn main() -> Result<()> {
     }
 
     if cli.check_plugins {
-        for (id, error) in check_plugins(&plugins, &cwd, cli.ignore)? {
+        for (id, error) in check_plugins(APP_DIR, &plugins, &cwd, cli.ignore)? {
             match error {
                 None => eprintln!("ok: {id}"),
                 Some(err) => eprintln!("ignored: {id}: {err}"),
@@ -403,6 +367,7 @@ fn main() -> Result<()> {
     }
 
     let composed_prompt = compose_prompt(
+        APP_DIR,
         DEFAULT_SYSTEM_PROMPT,
         Some(&mode),
         &plugins,
@@ -418,6 +383,7 @@ fn main() -> Result<()> {
 
     if !cli.print {
         mini_agent_tui::run(mini_agent_tui::RunOptions {
+            app_dir_name: APP_DIR.to_string(),
             system_prompt: composed_prompt,
             config,
             mode: mode.id,
@@ -568,6 +534,21 @@ fn main() -> Result<()> {
                         "status": output.status,
                         "stdout": output.stdout,
                         "stderr": output.stderr,
+                    }),
+                    AgentEvent::ToolUse { name, input } => serde_json::json!({
+                        "type": "tool_use",
+                        "name": name,
+                        "input": input,
+                    }),
+                    AgentEvent::ToolResult {
+                        name,
+                        output,
+                        is_error,
+                    } => serde_json::json!({
+                        "type": "tool_result",
+                        "name": name,
+                        "output": output,
+                        "is_error": is_error,
                     }),
                     AgentEvent::CompactionStarted { estimated_tokens } => serde_json::json!({
                         "type": "system",

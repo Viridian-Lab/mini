@@ -353,10 +353,11 @@ fn body_rows_with_lang<'a>(
     let body_width = width.saturating_sub(MESSAGE_INDENT).max(1);
     let mut rows = Vec::new();
     for line in lines {
+        let line = expand_tabs(line);
         if line.is_empty() {
             rows.push(String::new());
         } else {
-            rows.extend(wrap_chars(line, body_width).into_iter().map(|row| {
+            rows.extend(wrap_chars(&line, body_width).into_iter().map(|row| {
                 let mut row = match highlighter.highlight_line(&row, syntaxes) {
                     Ok(regions) => as_24_bit_terminal_escaped(&regions, false),
                     Err(_) => row,
@@ -372,7 +373,9 @@ fn body_rows_with_lang<'a>(
 fn output_body_rows(text: &str, width: usize) -> Vec<String> {
     let body_width = width.saturating_sub(MESSAGE_INDENT).max(1);
     let mut rows = Vec::new();
-    for line in text.lines() {
+    for raw_line in text.lines() {
+        let line = expand_tabs(&strip_ansi(raw_line));
+        let line = line.as_str();
         let color = if line.starts_with("command failed")
             || line.starts_with("command terminated")
             || line == "stderr:"
@@ -462,7 +465,14 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
                     line = String::new();
                 }
                 if visible_width(word) > width {
-                    rows.extend(wrap_chars(word, width));
+                    // Keep the final fragment in the in-progress line so the
+                    // next word can continue beside it instead of being
+                    // stranded on its own row.
+                    let mut chunks = wrap_chars(word, width);
+                    if let Some(last) = chunks.pop() {
+                        rows.extend(chunks);
+                        line = last;
+                    }
                 } else {
                     line.push_str(word);
                 }
@@ -475,21 +485,26 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+// Width math works on grapheme clusters, not Unicode scalars: string-level
+// width (UnicodeWidthStr) special-cases ZWJ emoji sequences and VS16 emoji
+// presentation, and never splitting a cluster keeps a family emoji or flag from
+// being broken across rows — per-scalar math both miscounts and splits them.
+
 fn wrap_chars(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut line = String::new();
     let mut line_width = 0;
 
-    for char in text.chars() {
-        let char_width = char.width().unwrap_or(0);
-        if line_width + char_width > width && !line.is_empty() {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if line_width + grapheme_width > width && !line.is_empty() {
             rows.push(line);
             line = String::new();
             line_width = 0;
         }
-        line.push(char);
-        line_width += char_width;
+        line.push_str(grapheme);
+        line_width += grapheme_width;
     }
 
     if !line.is_empty() {
@@ -498,19 +513,23 @@ fn wrap_chars(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+fn is_ansi_terminator(grapheme: &str) -> bool {
+    grapheme.len() == 1 && grapheme.as_bytes()[0].is_ascii_alphabetic()
+}
+
 fn fit(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    let mut chars = text.chars();
+    let mut graphemes = text.graphemes(true);
     let mut styled = false;
-    while let Some(char) = chars.next() {
-        if char == '\x1b' {
-            out.push(char);
-            if chars.next() == Some('[') {
+    while let Some(grapheme) = graphemes.next() {
+        if grapheme == "\x1b" {
+            out.push_str(grapheme);
+            if graphemes.next() == Some("[") {
                 out.push('[');
-                for char in chars.by_ref() {
-                    out.push(char);
-                    if char.is_ascii_alphabetic() {
+                for grapheme in graphemes.by_ref() {
+                    out.push_str(grapheme);
+                    if is_ansi_terminator(grapheme) {
                         styled = true;
                         break;
                     }
@@ -518,12 +537,12 @@ fn fit(text: &str, width: usize) -> String {
             }
             continue;
         }
-        let char_width = char.width().unwrap_or(0);
-        if used + char_width > width {
+        let grapheme_width = grapheme.width();
+        if used + grapheme_width > width {
             break;
         }
-        out.push(char);
-        used += char_width;
+        out.push_str(grapheme);
+        used += grapheme_width;
     }
     if styled {
         out.push_str(RESET);
@@ -533,19 +552,135 @@ fn fit(text: &str, width: usize) -> String {
 
 fn visible_width(text: &str) -> usize {
     let mut width = 0;
-    let mut chars = text.chars();
-    while let Some(char) = chars.next() {
-        if char == '\x1b' {
-            if chars.next() == Some('[') {
-                for char in chars.by_ref() {
-                    if char.is_ascii_alphabetic() {
+    let mut graphemes = text.graphemes(true);
+    while let Some(grapheme) = graphemes.next() {
+        if grapheme == "\x1b" {
+            if graphemes.next() == Some("[") {
+                for grapheme in graphemes.by_ref() {
+                    if is_ansi_terminator(grapheme) {
                         break;
                     }
                 }
             }
             continue;
         }
-        width += char.width().unwrap_or(0);
+        width += grapheme.width();
     }
     width
+}
+
+/// Expand tabs to spaces so counted width matches what the terminal renders
+/// (`'\t'.width()` is `None`, i.e. counted as 0, but terminals advance columns).
+fn expand_tabs(text: &str) -> String {
+    text.replace('\t', "    ")
+}
+
+/// Remove ANSI CSI escape sequences from text that we re-style ourselves
+/// (command output), so they neither inflate the wrap width nor get split
+/// across rows.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(char) = chars.next() {
+        if char == '\x1b' {
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[test]
+    fn visible_width_ignores_ansi_escapes() {
+        assert_eq!(visible_width("plain"), 5);
+        assert_eq!(visible_width(&format!("{RED}red{RESET}")), 3);
+        // CJK glyphs occupy two columns each.
+        assert_eq!(visible_width("日本"), 4);
+    }
+
+    #[test]
+    fn wrap_chars_respects_display_width_for_wide_glyphs() {
+        // Width 3 cannot fit two double-width glyphs on one row.
+        let rows = wrap_chars("日本語", 3);
+        assert!(rows.iter().all(|row| visible_width(row) <= 3));
+        let recombined = rows.concat();
+        assert_eq!(recombined, "日本語");
+    }
+
+    #[test]
+    fn width_math_treats_zwj_emoji_as_one_cluster() {
+        // Family emoji: 3 scalars joined by ZWJ render as one 2-column glyph.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(visible_width(family), 2);
+        // Wrapping must never break inside the cluster.
+        let rows = wrap_chars(&format!("{family}{family}"), 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], family);
+        assert_eq!(rows[1], family);
+        // fit() must drop the whole cluster rather than truncate mid-sequence.
+        assert_eq!(fit(family, 1), "");
+        assert_eq!(fit(family, 2), family);
+    }
+
+    #[test]
+    fn width_math_counts_vs16_emoji_as_two_columns() {
+        // Red heart: U+2764 (width 1 alone) + VS16 forces 2-column emoji
+        // presentation in terminals.
+        let heart = "\u{2764}\u{FE0F}";
+        assert_eq!(visible_width(heart), 2);
+        let rows = wrap_chars(&format!("{heart}{heart}"), 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.concat(), format!("{heart}{heart}"));
+    }
+
+    #[test]
+    fn wrap_chars_never_splits_a_multibyte_char() {
+        // A single 4-byte emoji must survive intact even when narrower than its width.
+        let rows = wrap_chars("😀😀", 1);
+        assert_eq!(rows.concat(), "😀😀");
+        for row in &rows {
+            assert!(row.chars().count() >= 1);
+        }
+    }
+
+    #[test]
+    fn wrap_words_breaks_overlong_words_by_char() {
+        let rows = wrap_words("supercalifragilistic", 5);
+        assert!(rows.iter().all(|row| visible_width(row) <= 5));
+        assert_eq!(rows.concat(), "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_words_preserves_blank_lines() {
+        let rows = wrap_words("a\n\nb", 10);
+        assert_eq!(rows, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn fit_truncates_to_width_and_closes_styles() {
+        // Multi-byte input must not panic and must respect display width.
+        let out = fit("日本語テスト", 4);
+        assert!(visible_width(&out) <= 4);
+        // A styled string that gets truncated is reset so color does not bleed.
+        let styled = fit(&format!("{RED}hello world"), 3);
+        assert!(styled.ends_with(RESET));
+    }
+
+    #[test]
+    fn markdown_rows_handles_empty_and_code_without_panic() {
+        assert!(markdown_rows("", 20, 40).is_empty());
+        let rows = markdown_rows("```rust\nfn main() {}\n```", 20, 40);
+        assert!(rows.iter().any(|row| row.contains("main")));
+    }
 }

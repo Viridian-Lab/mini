@@ -108,18 +108,11 @@ impl ModelConfig {
     }
 }
 
+/// Upper bound on model-list pagination requests, so a misbehaving endpoint
+/// returning an unchanging cursor cannot loop forever.
+const MAX_MODEL_LIST_PAGES: usize = 100;
+
 pub fn list_models(
-    config: &ModelConfig,
-    providers: &BTreeMap<String, ProviderConfig>,
-) -> Result<Vec<String>> {
-    list_models_for_app(".mini-agent", config, providers)
-}
-
-pub fn list_models_for_config(config: &Config) -> Result<Vec<String>> {
-    list_models_for_app(&config.app_dir_name, &config.model, &config.providers)
-}
-
-pub fn list_models_for_app(
     app_dir_name: &str,
     config: &ModelConfig,
     providers: &BTreeMap<String, ProviderConfig>,
@@ -129,6 +122,7 @@ pub fn list_models_for_app(
         model: config.clone(),
         providers: providers.clone(),
         app_dir_name: app_dir_name.to_string(),
+        auth_app_dir_name: None,
     };
     let provider = config.provider(providers)?;
     let base_url = provider
@@ -211,7 +205,7 @@ pub fn list_models_for_app(
             if provider.protocol == ModelProtocol::Anthropic {
                 let mut models = Vec::new();
                 let mut after_id: Option<String> = None;
-                loop {
+                for _ in 0..MAX_MODEL_LIST_PAGES {
                     let mut url = url::Url::parse(&format!("{base_url}/models"))?;
                     url.query_pairs_mut().append_pair("limit", "1000");
                     if let Some(after_id) = &after_id {
@@ -231,10 +225,13 @@ pub fn list_models_for_app(
                     if response["has_more"].as_bool() != Some(true) {
                         break;
                     }
-                    after_id = response["last_id"].as_str().map(str::to_string);
-                    if after_id.is_none() {
+                    let next = response["last_id"].as_str().map(str::to_string);
+                    // Stop if the cursor is missing or did not advance, so a
+                    // buggy/hostile endpoint cannot spin forever.
+                    if next.is_none() || next == after_id {
                         break;
                     }
+                    after_id = next;
                 }
                 models
             } else {
@@ -245,7 +242,7 @@ pub fn list_models_for_app(
             if provider.protocol == ModelProtocol::Gemini {
                 let mut models = Vec::new();
                 let mut page_token: Option<String> = None;
-                loop {
+                for _ in 0..MAX_MODEL_LIST_PAGES {
                     let mut url = url::Url::parse(&format!("{base_url}/models"))?;
                     url.query_pairs_mut().append_pair("pageSize", "1000");
                     if let Some(page_token) = &page_token {
@@ -269,10 +266,12 @@ pub fn list_models_for_app(
                             }
                         }
                     }
-                    page_token = response["nextPageToken"].as_str().map(str::to_string);
-                    if page_token.is_none() {
+                    let next = response["nextPageToken"].as_str().map(str::to_string);
+                    // Stop if the cursor is missing or did not advance.
+                    if next.is_none() || next == page_token {
                         break;
                     }
+                    page_token = next;
                 }
                 models
             } else {
@@ -289,4 +288,3 @@ pub fn list_models_for_app(
     }
     Ok(models)
 }
-

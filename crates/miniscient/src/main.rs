@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mini_agent_core::{
     AgentEvent, AgentOptions, AgentServer, AgentServerMessage, AgentServerReload,
-    AgentServerStatus, auth_status_for_app, logout_for_app, oauth_login_for_app,
+    AgentServerStatus, Config, auth_status, logout, oauth_login,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,9 +11,21 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
+
+mod mcp;
 
 const APP_DIR: &str = ".miniscient";
+const MINI_AUTH_DIR: &str = ".mini-agent";
 const DEFAULT_ADDR: &str = "127.0.0.1:47873";
+
+/// miniscient's home directory (`~/.miniscient`), where it reads `mcp.toml`.
+fn miniscient_root() -> Option<PathBuf> {
+    Config::app_paths(APP_DIR).map(|paths| paths.root)
+}
+/// Upper bound on an accepted request body, so a client-supplied Content-Length
+/// cannot drive an unbounded allocation.
+const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "miniscient")]
@@ -89,6 +101,7 @@ struct StatusResult {
     provider: String,
     model: String,
     plugins: Vec<String>,
+    tools: Vec<String>,
     cwd: String,
     home: Option<String>,
     messages: usize,
@@ -120,6 +133,11 @@ enum WireEvent {
         stdout: String,
         stderr: String,
     },
+    ToolOutput {
+        name: String,
+        output: String,
+        is_error: bool,
+    },
     CompactStarted {
         estimated_tokens: usize,
     },
@@ -140,22 +158,23 @@ fn main() -> Result<()> {
     }) {
         Command::Auth { command } => match command {
             AuthCommand::Login => {
-                let auth = oauth_login_for_app(APP_DIR, |url| {
-                    eprintln!("Open this URL to sign in:\n{url}")
-                })?;
+                let auth =
+                    oauth_login(APP_DIR, |url| eprintln!("Open this URL to sign in:\n{url}"))?;
                 println!("logged in with {}", auth.auth_mode);
                 Ok(())
             }
             AuthCommand::Status => {
-                if let Some(auth) = auth_status_for_app(APP_DIR)? {
+                if let Some(auth) = auth_status(APP_DIR)? {
                     println!("{}", auth.auth_mode);
+                } else if let Some(auth) = auth_status(MINI_AUTH_DIR)? {
+                    println!("{} (from {MINI_AUTH_DIR})", auth.auth_mode);
                 } else {
                     println!("not logged in");
                 }
                 Ok(())
             }
             AuthCommand::Logout => {
-                logout_for_app(APP_DIR)?;
+                logout(APP_DIR)?;
                 println!("logged out");
                 Ok(())
             }
@@ -189,12 +208,64 @@ fn serve(
     options.ignore_plugin_errors = ignore_plugin_errors;
     options.yolo = yolo;
     options.seed_default_plugins = true;
+    if auth_status(APP_DIR)?.is_none() && auth_status(MINI_AUTH_DIR)?.is_some() {
+        options.auth_app_dir_name = Some(MINI_AUTH_DIR.to_string());
+    }
+
+    // MCP servers configured in ~/.miniscient/mcp.toml.
+    let mut mcp_config = match miniscient_root() {
+        Some(root) => mcp::load_config(&root)?,
+        None => mcp::McpConfig::default(),
+    };
 
     let server = AgentServer::new(options)?;
     let skipped_plugins = server.skipped_plugins();
     if !skipped_plugins.is_empty() {
         eprintln!("skipped plugins:\n{}", skipped_plugins.join("\n"));
     }
+
+    // Merge MCP servers declared by active plugins via an `[mcp]` front-matter
+    // table; a name already set in mcp.toml takes precedence.
+    for plugin in server.plugins() {
+        let Some(value) = plugin.metadata("mcp") else {
+            continue;
+        };
+        match value
+            .clone()
+            .try_into::<BTreeMap<String, mcp::ServerConfig>>()
+        {
+            Ok(servers) => {
+                for (name, server_config) in servers {
+                    match mcp_config.servers.entry(name) {
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(server_config);
+                        }
+                        std::collections::btree_map::Entry::Occupied(slot) => eprintln!(
+                            "mcp: plugin '{}' server '{}' ignored (already configured)",
+                            plugin.id,
+                            slot.key()
+                        ),
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "mcp: plugin '{}' has an invalid [mcp] table: {err}",
+                    plugin.id
+                )
+            }
+        }
+    }
+
+    // Connect to every configured server and mount its tools.
+    let (tools, notes) = mcp::mount(&mcp_config);
+    for note in &notes {
+        eprintln!("mcp: {note}");
+    }
+    if !tools.is_empty() {
+        eprintln!("mounted {} MCP tool(s)", tools.len());
+    }
+    server.mount_tools(tools);
 
     let listener =
         TcpListener::bind(&listen).with_context(|| format!("failed to listen on {listen}"))?;
@@ -231,6 +302,16 @@ impl From<AgentEvent> for WireEvent {
                 stdout: output.stdout,
                 stderr: output.stderr,
             },
+            AgentEvent::ToolUse { name, input } => Self::ToolUse { name, input },
+            AgentEvent::ToolResult {
+                name,
+                output,
+                is_error,
+            } => Self::ToolOutput {
+                name,
+                output,
+                is_error,
+            },
             AgentEvent::CompactionStarted { estimated_tokens } => {
                 Self::CompactStarted { estimated_tokens }
             }
@@ -262,6 +343,7 @@ impl From<AgentServerStatus> for StatusResult {
             provider: status.provider,
             model: status.model,
             plugins: status.plugins,
+            tools: status.tools,
             cwd: status.cwd.display().to_string(),
             home: status.home.map(|home| home.display().to_string()),
             messages: status.messages,
@@ -280,6 +362,10 @@ impl From<AgentServerReload> for ReloadResult {
 }
 
 fn handle_connection(mut stream: TcpStream, server: AgentServer) -> Result<()> {
+    // Bound how long a single connection can stall the worker thread waiting on
+    // a slow or idle client (slowloris).
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let (method, path, body) = read_http_request(&stream)?;
     let response = route_request(&method, &path, body.as_deref(), server);
     let (status, value) = match response {
@@ -359,6 +445,9 @@ fn read_http_request(stream: &TcpStream) -> Result<(String, String, Option<Strin
             && name.eq_ignore_ascii_case("content-length")
         {
             content_length = value.trim().parse().context("invalid content-length")?;
+            if content_length > MAX_REQUEST_BODY {
+                anyhow::bail!("request body too large ({content_length} bytes)");
+            }
         }
     }
     let body = if content_length == 0 {

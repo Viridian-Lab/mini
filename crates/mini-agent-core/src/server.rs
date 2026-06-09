@@ -1,7 +1,6 @@
-use crate::plugin::active_plugin_id_set;
 use crate::{
     Agent, AgentEvent, Config, DEFAULT_PLUGINS, DEFAULT_SYSTEM_PROMPT, ModelMessage, Plugin,
-    PluginError, PluginKind, compose_prompt_for_app, install_scripts_for_app, load_plugin_for_app,
+    PluginKind, Tool, compose_prompt, install_scripts, load_active_plugins, load_plugin,
 };
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -10,24 +9,29 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
     pub app_dir_name: String,
+    pub auth_app_dir_name: Option<String>,
     pub cwd: PathBuf,
     pub plugins: Vec<PathBuf>,
     pub append_system_prompt: Option<String>,
     pub ignore_plugin_errors: bool,
     pub yolo: bool,
     pub seed_default_plugins: bool,
+    /// Tools to mount in addition to the built-in `bash` (e.g. MCP tools).
+    pub tools: Vec<Arc<dyn Tool>>,
 }
 
 impl AgentOptions {
     pub fn new(app_dir_name: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             app_dir_name: app_dir_name.into(),
+            auth_app_dir_name: None,
             cwd: cwd.into(),
             plugins: Vec::new(),
             append_system_prompt: None,
             ignore_plugin_errors: false,
             yolo: false,
             seed_default_plugins: false,
+            tools: Vec::new(),
         }
     }
 }
@@ -40,6 +44,7 @@ pub struct AgentServer {
 #[derive(Debug, Clone)]
 struct AgentServerInner {
     app_dir_name: String,
+    auth_app_dir_name: Option<String>,
     agent: Agent,
     mode: String,
     plugins: Vec<Plugin>,
@@ -49,6 +54,9 @@ struct AgentServerInner {
     ignore_plugin_errors: bool,
     yolo: bool,
     skipped_plugins: Vec<String>,
+    /// Mounted tools, kept so `reload` can re-attach them to the rebuilt agent
+    /// without reconnecting (MCP connections are live).
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +73,8 @@ pub struct AgentServerStatus {
     pub provider: String,
     pub model: String,
     pub plugins: Vec<String>,
+    /// Names of mounted tools (beyond the built-in `bash`), e.g. MCP tools.
+    pub tools: Vec<String>,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     pub messages: usize,
@@ -86,6 +96,7 @@ impl AgentServer {
         Ok(Self {
             inner: Arc::new(Mutex::new(AgentServerInner {
                 app_dir_name: options.app_dir_name,
+                auth_app_dir_name: options.auth_app_dir_name,
                 agent,
                 mode,
                 plugins,
@@ -95,12 +106,13 @@ impl AgentServer {
                 ignore_plugin_errors: options.ignore_plugin_errors,
                 yolo: options.yolo,
                 skipped_plugins,
+                tools: options.tools,
             })),
         })
     }
 
     pub fn message(&self, text: impl Into<String>) -> Result<AgentServerMessage> {
-        let mut inner = self.inner.lock().expect("agent server lock poisoned");
+        let mut inner = self.lock();
         let mut events = Vec::new();
         let run = inner.agent.run_with_events(text, |event| {
             events.push(event);
@@ -113,7 +125,7 @@ impl AgentServer {
     }
 
     pub fn status(&self) -> AgentServerStatus {
-        let inner = self.inner.lock().expect("agent server lock poisoned");
+        let inner = self.lock();
         AgentServerStatus {
             app_dir_name: inner.app_dir_name.clone(),
             mode: inner.mode.clone(),
@@ -124,6 +136,12 @@ impl AgentServer {
                 .iter()
                 .map(|plugin| plugin.id.clone())
                 .collect(),
+            tools: inner
+                .agent
+                .tools
+                .iter()
+                .map(|tool| tool.spec().name)
+                .collect(),
             cwd: inner.cwd.clone(),
             home: Config::app_paths(&inner.app_dir_name).map(|paths| paths.root),
             messages: inner.agent.messages.len(),
@@ -131,15 +149,17 @@ impl AgentServer {
     }
 
     pub fn reload(&self) -> Result<AgentServerReload> {
-        let mut inner = self.inner.lock().expect("agent server lock poisoned");
+        let mut inner = self.lock();
         let options = AgentOptions {
             app_dir_name: inner.app_dir_name.clone(),
+            auth_app_dir_name: inner.auth_app_dir_name.clone(),
             cwd: inner.cwd.clone(),
             plugins: inner.plugin_specs.clone(),
             append_system_prompt: inner.append_system_prompt.clone(),
             ignore_plugin_errors: inner.ignore_plugin_errors,
             yolo: inner.yolo,
             seed_default_plugins: false,
+            tools: inner.tools.clone(),
         };
         let (mut agent, mode, plugins, skipped_plugins) = load_agent(&options)?;
         agent.messages = inner.agent.messages.clone();
@@ -155,54 +175,63 @@ impl AgentServer {
     }
 
     pub fn history(&self) -> Vec<ModelMessage> {
-        self.inner
-            .lock()
-            .expect("agent server lock poisoned")
-            .agent
-            .messages
-            .clone()
+        self.lock().agent.messages.clone()
     }
 
     pub fn clear(&self) {
-        self.inner
-            .lock()
-            .expect("agent server lock poisoned")
-            .agent
-            .messages
-            .clear();
+        self.lock().agent.messages.clear();
     }
 
     pub fn skipped_plugins(&self) -> Vec<String> {
+        self.lock().skipped_plugins.clone()
+    }
+
+    /// The active plugins, so a front-end can read their front-matter metadata.
+    pub fn plugins(&self) -> Vec<Plugin> {
+        self.lock().plugins.clone()
+    }
+
+    /// Attach more tools to the running agent (in addition to the built-in
+    /// `bash` and any already mounted). They are also retained so a `reload`
+    /// re-attaches them to the rebuilt agent.
+    pub fn mount_tools(&self, tools: Vec<Arc<dyn Tool>>) {
+        let mut inner = self.lock();
+        inner.agent.mount_tools(tools.iter().cloned());
+        inner.tools.extend(tools);
+    }
+
+    /// Lock the inner state, recovering the data if a previous holder panicked
+    /// rather than poisoning the mutex and bricking every future request.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AgentServerInner> {
         self.inner
             .lock()
-            .expect("agent server lock poisoned")
-            .skipped_plugins
-            .clone()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
 fn load_agent(options: &AgentOptions) -> Result<(Agent, String, Vec<Plugin>, Vec<String>)> {
-    let config = Config::load_from_app(&options.app_dir_name).with_context(|| {
+    let mut config = Config::load_from_app(&options.app_dir_name).with_context(|| {
         format!(
             "failed to load ~/{}/config.toml",
             options.app_dir_name.trim_start_matches('/')
         )
     })?;
+    config.auth_app_dir_name = options.auth_app_dir_name.clone();
     let mode_spec = config.agent.default_mode.clone();
-    let mode = load_plugin_for_app(&options.app_dir_name, &mode_spec)
+    let mode = load_plugin(&options.app_dir_name, &mode_spec)
         .with_context(|| format!("failed to load mode '{mode_spec}'"))?;
     if mode.kind != PluginKind::Mode {
         anyhow::bail!("plugin '{}' is not a mode", mode.id);
     }
-    let (plugins, skipped_plugins) = load_plugins(
+    let (plugins, skipped_plugins) = load_active_plugins(
         &options.app_dir_name,
-        &config,
+        &config.agent.plugins,
         &options.plugins,
         &options.cwd,
         options.ignore_plugin_errors,
     )?;
     if let Some(paths) = Config::ensure_app_files(&options.app_dir_name)? {
-        install_scripts_for_app(
+        install_scripts(
             &options.app_dir_name,
             &paths,
             &mode,
@@ -212,7 +241,7 @@ fn load_agent(options: &AgentOptions) -> Result<(Agent, String, Vec<Plugin>, Vec
             options.ignore_plugin_errors,
         )?;
     }
-    let system = compose_prompt_for_app(
+    let system = compose_prompt(
         &options.app_dir_name,
         DEFAULT_SYSTEM_PROMPT,
         Some(&mode),
@@ -221,71 +250,9 @@ fn load_agent(options: &AgentOptions) -> Result<(Agent, String, Vec<Plugin>, Vec
         options.append_system_prompt.as_deref(),
         options.ignore_plugin_errors,
     )?;
-    Ok((
-        Agent::new(system, config),
-        mode.id,
-        plugins,
-        skipped_plugins,
-    ))
-}
-
-fn load_plugins(
-    app_dir_name: &str,
-    config: &Config,
-    plugin_specs: &[PathBuf],
-    cwd: &PathBuf,
-    ignore_plugin_errors: bool,
-) -> Result<(Vec<Plugin>, Vec<String>)> {
-    let mut plugins = Vec::new();
-    for spec in &config.agent.plugins {
-        let plugin = match load_plugin_for_app(app_dir_name, spec)
-            .with_context(|| format!("failed to load plugin '{spec}'"))
-        {
-            Ok(plugin) => plugin,
-            Err(_) if ignore_plugin_errors => continue,
-            Err(err) => return Err(err),
-        };
-        if plugin.kind != PluginKind::Plugin {
-            if ignore_plugin_errors {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
-    }
-    for path in plugin_specs {
-        let plugin = match load_plugin_for_app(app_dir_name, path)
-            .with_context(|| format!("failed to load plugin '{}'", path.display()))
-        {
-            Ok(plugin) => plugin,
-            Err(_) if ignore_plugin_errors => continue,
-            Err(err) => return Err(err),
-        };
-        if plugin.kind != PluginKind::Plugin {
-            if ignore_plugin_errors {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
-    }
-    plugins.sort_by(|left, right| left.id.cmp(&right.id));
-    plugins.dedup_by(|left, right| left.id == right.id);
-
-    let active_plugins = active_plugin_id_set(&plugins);
-    let mut available = Vec::new();
-    let mut skipped = Vec::new();
-    for plugin in plugins {
-        match plugin.render_for_app(app_dir_name, cwd, &active_plugins) {
-            Ok(_) => available.push(plugin),
-            Err(err @ PluginError::MissingCommand { .. }) => {
-                skipped.push(format!("{}: {err}", plugin.id));
-            }
-            Err(_) if ignore_plugin_errors => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok((available, skipped))
+    let mut agent = Agent::new(system, config);
+    agent.mount_tools(options.tools.iter().cloned());
+    Ok((agent, mode.id, plugins, skipped_plugins))
 }
 
 fn seed_default_plugins(app_dir_name: &str) -> Result<()> {
@@ -304,5 +271,5 @@ fn seed_default_plugins(app_dir_name: &str) -> Result<()> {
             config.agent.plugins.push(id.to_string());
         }
     }
-    config.save_for_app(app_dir_name)
+    config.save()
 }

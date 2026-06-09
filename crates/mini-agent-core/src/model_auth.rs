@@ -62,17 +62,17 @@ pub fn auth_token(config: &Config, provider: &Provider) -> Result<(Option<String
             anyhow::bail!("missing API key environment variable {api_key_env}")
         }
         ModelAuth::CodexOauth => {
-            let auth_command = if config.app_dir_name == ".miniscient" {
-                "miniscient"
-            } else {
-                "mini"
-            };
-            let auth = codex_auth_for_app(&config.app_dir_name)?.with_context(|| {
-                format!("missing Codex OAuth token; run `{auth_command} auth login`")
+            let auth_app_dir_name = config
+                .auth_app_dir_name
+                .as_deref()
+                .unwrap_or(&config.app_dir_name);
+            let auth = codex_auth(auth_app_dir_name)?.with_context(|| {
+                format!("missing Codex OAuth token in '{auth_app_dir_name}'")
             })?;
             let account_id = auth.account_id.with_context(|| {
                 format!(
-                    "Codex OAuth token did not include a ChatGPT account id; run `{auth_command} auth logout` then `{auth_command} auth login`"
+                    "Codex OAuth token in '{}' did not include a ChatGPT account id",
+                    auth_app_dir_name
                 )
             })?;
             Ok((Some(auth.access_token), Some(account_id)))

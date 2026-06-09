@@ -3,7 +3,12 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), cursor::Show, terminal::EnableLineWrap);
+        let _ = execute!(
+            io::stdout(),
+            event::DisableBracketedPaste,
+            cursor::Show,
+            terminal::EnableLineWrap
+        );
     }
 }
 
@@ -12,20 +17,29 @@ pub fn run(options: RunOptions) -> Result<()> {
     let _guard = TerminalGuard;
 
     let mut stdout = io::stdout();
-    execute!(stdout, cursor::Hide, terminal::EnableLineWrap)
-        .context("failed to initialize terminal")?;
+    // Bracketed paste delivers a paste as one Event::Paste instead of a stream
+    // of key events, so multi-line pastes do not auto-submit one line at a time.
+    execute!(
+        stdout,
+        cursor::Hide,
+        terminal::EnableLineWrap,
+        event::EnableBracketedPaste
+    )
+    .context("failed to initialize terminal")?;
 
+    let app_dir_name = options.app_dir_name;
     let mut agent = Agent::new(options.system_prompt, options.config);
     let mut mode = options.mode;
     let mut session_title = None;
     let session_id = if let Some(spec) = options.resume {
-        let session = load_session(&spec)?;
+        let session = load_session(&app_dir_name, &spec)?;
         session_title = session_title_from_stored(&session);
         mode = session.mode.clone();
         agent = Agent {
             system: session.system,
             config: session.config,
             messages: session.messages,
+            tools: Vec::new(),
         };
         session.id
     } else {
@@ -52,6 +66,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     ));
     let replay = messages_from_history(&agent.messages);
     let mut app = App {
+        app_dir_name,
         messages: replay,
         history: Vec::new(),
         history_index: None,
@@ -115,8 +130,22 @@ pub fn run(options: RunOptions) -> Result<()> {
                         }
                     }
                     Ok(AgentUpdate::Done(agent, Ok(()))) => {
+                        let was_interrupted = running.interrupted.load(Ordering::Relaxed);
                         app.agent = Some(*agent);
                         app.running_since = None;
+                        if was_interrupted {
+                            // The run completed just before the interrupt took
+                            // effect, so its tail events were dropped above.
+                            // Rebuild the view from history so the UI matches
+                            // what was actually saved instead of staying stuck
+                            // on "interrupting model…".
+                            discard_streaming(&mut app);
+                            if let Some(agent) = &app.agent {
+                                app.messages = messages_from_history(&agent.messages);
+                            }
+                            app.printed_messages = 0;
+                            app.needs_full_redraw = true;
+                        }
                         save_session(&mut app)?;
                         keep_running = false;
                         break;
@@ -159,6 +188,19 @@ pub fn run(options: RunOptions) -> Result<()> {
             finish_streaming(&mut app);
             app.running = None;
             app.running_since = None;
+            // The worker thread dropped its sender without returning the agent
+            // (e.g. it panicked). Rebuild the agent from the last saved session
+            // so the TUI stays usable instead of wedging on a None agent.
+            if app.agent.is_none()
+                && let Ok(session) = load_session(&app.app_dir_name, &app.session_id)
+            {
+                app.agent = Some(Agent {
+                    system: session.system,
+                    config: session.config,
+                    messages: session.messages,
+                    tools: Vec::new(),
+                });
+            }
             app.messages.push(Message {
                 role: Role::Local,
                 text: "model runner stopped without returning a result".to_string(),
@@ -184,6 +226,29 @@ pub fn run(options: RunOptions) -> Result<()> {
                 ..
             }) => {
                 if matches!((code, modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+                    // If a turn is in flight, signal the worker and give it a
+                    // bounded moment to return the agent so the in-flight turn
+                    // (prompt, completed tool calls, outputs) is saved before we
+                    // exit, rather than abandoning the thread.
+                    if let Some(running) = app.running.take() {
+                        running.interrupted.store(true, Ordering::Relaxed);
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        loop {
+                            if Instant::now() > deadline {
+                                break;
+                            }
+                            match running.receiver.recv_timeout(Duration::from_millis(100)) {
+                                Ok(AgentUpdate::Done(agent, _)) => {
+                                    app.agent = Some(*agent);
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        let _ = save_session(&mut app);
+                    }
                     break;
                 }
 
@@ -314,7 +379,15 @@ pub fn run(options: RunOptions) -> Result<()> {
                         let (sender, receiver) = mpsc::channel();
                         let interrupted = Arc::new(AtomicBool::new(false));
                         let thread_interrupted = interrupted.clone();
-                        let mut agent = app.agent.take().context("agent is already running")?;
+                        let Some(mut agent) = app.agent.take() else {
+                            app.messages.push(Message {
+                                role: Role::Local,
+                                text: "agent state was lost; /resume the session to continue"
+                                    .to_string(),
+                                output: None,
+                            });
+                            continue;
+                        };
                         let mut context_messages = agent.messages.clone();
                         context_messages.push(ModelMessage {
                             role: ModelRole::User,
@@ -322,6 +395,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                             tool_calls: Vec::new(),
                             tool_result: None,
                             synthetic: None,
+                            thinking: Vec::new(),
                         });
                         app.context_percent = Some(context_percent_for(
                             &agent.system,
@@ -398,9 +472,17 @@ pub fn run(options: RunOptions) -> Result<()> {
                 }
             }
             Event::Paste(text) => {
-                for char in text.chars().filter(|char| !char.is_control()) {
-                    app.input.insert(app.cursor, char);
-                    app.cursor += 1;
+                // Preserve newlines (so pasted multi-line code is not silently
+                // concatenated) and expand tabs; drop other control characters.
+                let normalized = text
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('\t', "    ");
+                for char in normalized.chars() {
+                    if char == '\n' || !char.is_control() {
+                        app.input.insert(app.cursor, char);
+                        app.cursor += 1;
+                    }
                 }
                 app.history_index = None;
                 sync_command_palette(&mut app);

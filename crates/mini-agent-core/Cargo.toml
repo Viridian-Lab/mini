@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow = "1.0.98"
 base64 = "0.22.1"
+dirs = "6.0.0"
 minijinja = "2.9.0"
 rand = "0.8.5"
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -19,3 +20,6 @@ thiserror = "2.0.12"
 toml = "0.8.22"
 url = "2.5.7"
 which = "7.0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

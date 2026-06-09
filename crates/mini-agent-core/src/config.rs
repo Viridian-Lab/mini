@@ -34,9 +34,13 @@ pub const DEFAULT_PLUGINS: &[(&str, &str)] = &[
         include_str!("../assets/plugins/subagents.md"),
     ),
     ("memories.md", include_str!("../assets/plugins/memories.md")),
+    (
+        "codex-computer-use.md",
+        include_str!("../assets/plugins/codex-computer-use.md"),
+    ),
 ];
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
@@ -44,23 +48,16 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfig>,
-    #[serde(skip, default = "default_app_dir_name")]
+    /// The app's state directory name under the user's home directory, or an
+    /// absolute path. Set by the caller via `load_from_app`; the core ships no
+    /// default so it stays free of any particular front-end's identity.
+    #[serde(skip)]
     pub app_dir_name: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            agent: AgentConfig::default(),
-            model: ModelConfig::default(),
-            providers: BTreeMap::new(),
-            app_dir_name: default_app_dir_name(),
-        }
-    }
-}
-
-fn default_app_dir_name() -> String {
-    ".mini-agent".to_string()
+    /// Optional app state directory name/path used only for auth. This lets a
+    /// front-end keep its own config/state while sharing login state with
+    /// another front-end, without the core knowing either identity.
+    #[serde(skip)]
+    pub auth_app_dir_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -90,41 +87,39 @@ impl Default for AgentConfig {
 }
 
 impl Config {
-    pub fn load_default() -> anyhow::Result<Self> {
-        Self::load_from_app(".mini-agent")
-    }
-
     pub fn load_from_app(app_dir_name: &str) -> anyhow::Result<Self> {
         let Some(paths) = Self::ensure_app_files(app_dir_name)? else {
-            return Ok(Self::default());
+            return Ok(Self {
+                app_dir_name: app_dir_name.to_string(),
+                ..Self::default()
+            });
         };
 
         let source = std::fs::read_to_string(&paths.config_file)?;
         let mut config: Self = toml::from_str(&source)?;
         config.app_dir_name = app_dir_name.to_string();
+        config.auth_app_dir_name = None;
         Ok(config)
     }
 
-    pub fn save_default(&self) -> anyhow::Result<()> {
-        self.save_for_app(".mini-agent")
-    }
-
-    pub fn save_for_app(&self, app_dir_name: &str) -> anyhow::Result<()> {
-        let Some(paths) = Self::ensure_app_files(app_dir_name)? else {
-            anyhow::bail!("HOME is not set, so {app_dir_name}/config.toml cannot be updated");
+    /// Persist this config to its own app directory (`self.app_dir_name`).
+    pub fn save(&self) -> anyhow::Result<()> {
+        let Some(paths) = Self::ensure_app_files(&self.app_dir_name)? else {
+            anyhow::bail!(
+                "HOME is not set, so {}/config.toml cannot be updated",
+                self.app_dir_name
+            );
         };
         std::fs::write(&paths.config_file, toml::to_string_pretty(self)?)
             .with_context(|| format!("failed to write '{}'", paths.config_file.display()))?;
         Ok(())
     }
 
-    pub fn user_paths() -> Option<ConfigPaths> {
-        Self::app_paths(".mini-agent")
-    }
-
     pub fn app_paths(app_dir_name: &str) -> Option<ConfigPaths> {
-        let home = std::env::var_os("HOME")?;
-        let root = PathBuf::from(home).join(app_dir_name);
+        if app_dir_name.is_empty() {
+            return None;
+        }
+        let root = Self::app_root(app_dir_name)?;
         Some(ConfigPaths {
             config_file: root.join("config.toml"),
             modes_dir: root.join("modes"),
@@ -136,8 +131,20 @@ impl Config {
         })
     }
 
-    pub fn ensure_user_files() -> anyhow::Result<Option<ConfigPaths>> {
-        Self::ensure_app_files(".mini-agent")
+    pub fn app_root(app_dir_name: &str) -> Option<PathBuf> {
+        if app_dir_name.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(app_dir_name);
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            Self::home_dir().map(|home| home.join(path))
+        }
+    }
+
+    pub fn home_dir() -> Option<PathBuf> {
+        non_empty_env_path("HOME").or_else(dirs::home_dir)
     }
 
     pub fn ensure_app_files(app_dir_name: &str) -> anyhow::Result<Option<ConfigPaths>> {
@@ -170,22 +177,6 @@ impl Config {
         Ok(Some(paths))
     }
 
-    pub fn mode_file(id: &str) -> Option<PathBuf> {
-        Some(Self::mode_file_for_app(".mini-agent", id)?)
-    }
-
-    pub fn mode_file_for_app(app_dir_name: &str, id: &str) -> Option<PathBuf> {
-        Some(
-            Self::app_paths(app_dir_name)?
-                .modes_dir
-                .join(format!("{id}.md")),
-        )
-    }
-
-    pub fn path_with_bin() -> Option<OsString> {
-        Self::path_with_app_bin(".mini-agent")
-    }
-
     pub fn path_with_app_bin(app_dir_name: &str) -> Option<OsString> {
         let paths = Self::app_paths(app_dir_name)?;
         let mut path = vec![paths.bin_dir];
@@ -205,4 +196,13 @@ pub struct ConfigPaths {
     pub bin_dir: PathBuf,
     pub state_dir: PathBuf,
     pub app_dir_name: String,
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
 }

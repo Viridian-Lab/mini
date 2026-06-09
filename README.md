@@ -14,7 +14,8 @@ Markdown plugins that can install helper scripts.
 - **Plugin-installed helper scripts** under `~/.mini-agent/bin`.
 - **Session persistence and resume** for TUI conversations.
 - **Context compaction** with manual `/compact` and automatic thresholding.
-- **Bundled plugins** for Jujutsu, subagents, and project memories.
+- **Bundled plugins** for Jujutsu, subagents, project memories, and Codex
+  Computer Use.
 
 ## Quick start
 
@@ -36,8 +37,8 @@ For development, install or run from a checkout:
 
 ```sh
 cargo install --path .
-cargo run -p mini-agent-cli
-cargo run -p mini-agent-cli -- -p "summarize this repository"
+cargo run
+cargo run -- -p "summarize this repository"
 ```
 
 On first startup, `mini` creates editable defaults if they do not exist:
@@ -139,6 +140,12 @@ connectors such as SMS listeners, Telegram bots, or other small bridge programs.
 Those connectors can call the local HTTP interface instead of embedding agent
 logic.
 
+> **Security:** the server has no authentication and `POST /message` runs the
+> full agent loop, including model-issued `bash` commands. Treat any client that
+> can reach the socket as fully trusted. Keep `--listen` bound to a loopback
+> address (`127.0.0.1`), never expose it to a network, and only run trusted
+> connectors against it.
+
 Start the server:
 
 ```sh
@@ -178,7 +185,9 @@ deltas, tool use/results, and compaction.
 An example macOS iMessage connector lives at
 `examples/adapters/miniscient-imessage.sh`. It polls the local Messages database,
 forwards allowed inbound messages to `miniscient`, and replies through Messages
-using AppleScript.
+using AppleScript. A standalone Python port with the same flags lives alongside
+it at `examples/adapters/miniscient-imessage.py`; pick whichever fits your
+environment.
 
 ```sh
 examples/adapters/miniscient-imessage.sh --allow +15551234567
@@ -187,6 +196,81 @@ examples/adapters/miniscient-imessage.sh --allow +15551234567
 The adapter requires Full Disk Access for the process that runs it so it can
 read `~/Library/Messages/chat.db`, and Automation permission to control
 Messages. Use `--print-only` to test without sending replies.
+
+### Mounting MCP servers
+
+`miniscient` can mount [Model Context Protocol](https://modelcontextprotocol.io)
+servers and expose their tools to the agent alongside the built-in `bash` tool.
+Configure servers in `~/.miniscient/mcp.toml`:
+
+```toml
+# A local server over stdio (launched as a subprocess):
+[servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"]
+# env = { SOME_TOKEN = "..." }   # optional environment for the subprocess
+
+# A remote server over Streamable HTTP:
+[servers.docs]
+url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ..." }   # optional request headers
+```
+
+A plugin can also bundle the MCP server it needs by declaring an `[mcp]` table
+in its front matter, so a capability ships as one file (prompt guidance plus its
+server):
+
+```md
++++
+id = "websearch"
+title = "Web Search (MCP)"
+type = "plugin"
+
+[mcp.web]
+command = "npx"
+args = ["-y", "some-web-search-mcp"]
++++
+
+Use the `web__*` tools to search the web.
+```
+
+Plugin-declared servers are merged with `mcp.toml` (a name already set in
+`mcp.toml` wins). This works under `miniscient` (which has the MCP client); under
+`mini` the `[mcp]` table is inert and only the prose applies.
+
+The bundled `codex-computer-use` plugin declares the Codex app's built-in
+Computer Use MCP server on macOS. With Codex.app installed and permissions
+approved, enable it in `~/.miniscient/config.toml`:
+
+```toml
+[agent]
+plugins = ["codex-computer-use", "memories"]
+```
+
+Restart `miniscient`; its tools mount as `computer-use__list_apps`,
+`computer-use__get_app_state`, `computer-use__click`, and so on.
+
+On startup `miniscient` connects to each server, runs the MCP handshake, and
+mounts every tool it advertises. Tool names are namespaced as
+`<server>__<tool>` (e.g. `filesystem__read_file`) so tools from different
+servers cannot collide. A server that fails to connect is logged and skipped;
+the agent still starts.
+
+The mounted tools appear in `GET /status` under `tools`:
+
+```sh
+curl -s http://127.0.0.1:47873/status   # -> { ..., "tools": ["filesystem__read_file", ...] }
+```
+
+Both stdio and Streamable HTTP transports are supported. MCP machinery lives
+entirely in `miniscient`; `mini-agent-core` only defines the `Tool` trait that
+any front-end can implement.
+
+Notes: each MCP request is bounded by a timeout so a stalled server cannot wedge
+the agent, and a failing tool is reported back to the model (it can retry).
+`POST /reload` re-applies config and plugins but keeps existing MCP connections;
+restart `miniscient` to pick up `mcp.toml` changes or to reconnect a server that
+has exited.
 
 ## Configuration
 
@@ -415,28 +499,40 @@ example writes:
 
 `memories ls` prints a tree-like hierarchy.
 
+### `codex-computer-use`
+
+Declares the Codex app's bundled Computer Use MCP server for Miniscient. It does
+not install a helper script; Miniscient mounts the MCP server directly and exposes
+tools with the `computer-use__` prefix.
+
 ## Repository layout
 
 ```text
+src/main.rs              `mini` binary: CLI, print mode, auth and plugin commands
 crates/mini-agent-core/  prompt composition, config, model protocols, plugins
-crates/mini-agent-cli/   `mini` binary, print mode, auth and plugin commands
 crates/mini-agent-tui/   interactive terminal UI, sessions, slash commands
-examples/modes/          bundled editable modes
-examples/plugins/        bundled editable plugins
+crates/miniscient/       always-on local agent server for connectors
+examples/modes/          browsable copies of crates/mini-agent-core/assets/modes
+examples/plugins/        browsable copies of crates/mini-agent-core/assets/plugins
+examples/adapters/       example connectors for the miniscient server
 ```
+
+The bundled modes and plugins are compiled into the binary from
+`crates/mini-agent-core/assets/` via `include_str!`; the `examples/` copies are
+for browsing and `--plugin path/to.md` use.
 
 ## Development
 
 ```sh
 cargo fmt
 cargo check -q
-cargo run -p mini-agent-cli -- --check-plugins --plugin examples/plugins/memories.md
+cargo run -- --check-plugins --plugin examples/plugins/memories.md
 ```
 
 Useful local runs:
 
 ```sh
-cargo run -p mini-agent-cli -- --explain-prompt
-cargo run -p mini-agent-cli -- -p --output-format stream-json "say hi"
-cargo run -p mini-agent-cli -- auth status
+cargo run -- --explain-prompt
+cargo run -- -p --output-format stream-json "say hi"
+cargo run -- auth status
 ```

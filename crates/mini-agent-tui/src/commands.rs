@@ -79,7 +79,11 @@ fn handle_slash_command(app: &mut App, prompt: &str) -> Result<()> {
             Some(model) => set_model(app, model),
             None => {
                 let agent = app.agent.as_ref().context("agent is already running")?;
-                let models = list_models(&agent.config.model, &agent.config.providers)?;
+                let models = list_models(
+                    &app.app_dir_name,
+                    &agent.config.model,
+                    &agent.config.providers,
+                )?;
                 if models.is_empty() {
                     anyhow::bail!(
                         "provider '{}' has no models yet; use /model add <name>",
@@ -99,7 +103,7 @@ fn handle_slash_command(app: &mut App, prompt: &str) -> Result<()> {
         "/mode" => match parts.next() {
             Some(mode) => set_mode(app, mode),
             None => {
-                let Some(paths) = Config::ensure_user_files()? else {
+                let Some(paths) = Config::ensure_app_files(&app.app_dir_name)? else {
                     anyhow::bail!("HOME is not set, so modes cannot be listed");
                 };
                 let mut names = Vec::new();
@@ -198,16 +202,20 @@ keep recent messages: {}",
             None => {
                 let mut agent = app.agent.take().context("agent is already running")?;
                 let estimated = estimate_messages_tokens(&agent.system, &agent.messages);
-                agent.compact_history(&mut |event| handle_agent_event(app, event), estimated)?;
+                // Restore the agent even if compaction fails (e.g. network or
+                // auth error), otherwise app.agent stays None and every later
+                // command misreports "agent is already running".
+                let result =
+                    agent.compact_history(&mut |event| handle_agent_event(app, event), estimated);
                 app.agent = Some(agent);
-                Ok(())
+                result
             }
         },
         "/resume" => match parts.next() {
             Some(session) => resume_session(app, session),
             None => {
                 let mut sessions = Vec::new();
-                for entry in std::fs::read_dir(sessions_dir()?)? {
+                for entry in std::fs::read_dir(sessions_dir(&app.app_dir_name)?)? {
                     let entry = entry?;
                     let path = entry.path();
                     if path.extension().is_none_or(|extension| extension != "json") {
@@ -220,7 +228,7 @@ keep recent messages: {}",
                         .metadata()
                         .and_then(|metadata| metadata.modified())
                         .ok();
-                    let label = load_session(id)
+                    let label = load_session(&app.app_dir_name, id)
                         .map(|session| session_label(&session))
                         .unwrap_or_else(|_| id.to_string());
                     sessions.push((id.to_string(), label, updated));
@@ -290,17 +298,25 @@ fn sync_command_palette(app: &mut App) {
 
 
 fn reload_configuration(app: &mut App) -> Result<()> {
-    let mut config = Config::load_default().context("failed to reload ~/.mini-agent/config.toml")?;
+    let mut config = Config::load_from_app(&app.app_dir_name)
+        .with_context(|| format!("failed to reload ~/{}/config.toml", app.app_dir_name))?;
     let mode_spec = app.mode.clone();
-    let mode = load_plugin(&mode_spec).with_context(|| format!("failed to reload mode '{mode_spec}'"))?;
+    let mode = load_plugin(&app.app_dir_name, &mode_spec)
+        .with_context(|| format!("failed to reload mode '{mode_spec}'"))?;
     if mode.kind != PluginKind::Mode {
         anyhow::bail!("plugin '{}' is not a mode", mode.id);
     }
 
-    let (plugins, skipped_plugins) =
-        load_active_plugins(&config, &app.plugin_specs, &app.cwd, app.ignore_plugin_errors)?;
-    if let Some(paths) = Config::user_paths() {
+    let (plugins, skipped_plugins) = load_active_plugins(
+        &app.app_dir_name,
+        &config.agent.plugins,
+        &app.plugin_specs,
+        &app.cwd,
+        app.ignore_plugin_errors,
+    )?;
+    if let Some(paths) = Config::app_paths(&app.app_dir_name) {
         install_scripts(
+            &app.app_dir_name,
             &paths,
             &mode,
             &plugins,
@@ -315,6 +331,7 @@ fn reload_configuration(app: &mut App) -> Result<()> {
     }
 
     let system = compose_prompt(
+        &app.app_dir_name,
         DEFAULT_SYSTEM_PROMPT,
         Some(&mode),
         &plugins,
@@ -362,68 +379,13 @@ fn reload_configuration(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn load_active_plugins(
-    config: &Config,
-    plugin_specs: &[PathBuf],
-    cwd: &PathBuf,
-    ignore_plugin_errors: bool,
-) -> Result<(Vec<Plugin>, Vec<String>)> {
-    let mut plugins = Vec::new();
-    for spec in &config.agent.plugins {
-        let plugin = match load_plugin(spec).with_context(|| format!("failed to load plugin '{spec}'")) {
-            Ok(plugin) => plugin,
-            Err(_) if ignore_plugin_errors => continue,
-            Err(err) => return Err(err),
-        };
-        if plugin.kind != PluginKind::Plugin {
-            if ignore_plugin_errors {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
-    }
-    for path in plugin_specs {
-        let plugin = match load_plugin(path)
-            .with_context(|| format!("failed to load plugin '{}'", path.display()))
-        {
-            Ok(plugin) => plugin,
-            Err(_) if ignore_plugin_errors => continue,
-            Err(err) => return Err(err),
-        };
-        if plugin.kind != PluginKind::Plugin {
-            if ignore_plugin_errors {
-                continue;
-            }
-            anyhow::bail!("plugin '{}' is not a plugin", plugin.id);
-        }
-        plugins.push(plugin);
-    }
-    plugins.sort_by(|left, right| left.id.cmp(&right.id));
-    plugins.dedup_by(|left, right| left.id == right.id);
-
-    let active_plugins = plugins
-        .iter()
-        .map(|plugin| plugin.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut available_plugins = Vec::new();
-    let mut skipped_plugins = Vec::new();
-    for plugin in plugins {
-        match plugin.render(cwd, &active_plugins) {
-            Ok(_) => available_plugins.push(plugin),
-            Err(err @ PluginError::MissingCommand { .. }) => {
-                skipped_plugins.push(format!("{}: {err}", plugin.id));
-            }
-            Err(_) if ignore_plugin_errors => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok((available_plugins, skipped_plugins))
-}
 
 fn resume_session(app: &mut App, session: &str) -> Result<()> {
+    if app.running.is_some() {
+        anyhow::bail!("cannot switch sessions while the model is running; press Esc first");
+    }
     save_session(app)?;
-    let session = load_session(session)?;
+    let session = load_session(&app.app_dir_name, session)?;
     let session_id = session.id.clone();
     let session_title = session_title_from_stored(&session);
     let mode = session.mode.clone();
@@ -431,6 +393,7 @@ fn resume_session(app: &mut App, session: &str) -> Result<()> {
         system: session.system,
         config: session.config,
         messages: session.messages,
+        tools: Vec::new(),
     };
 
     app.session_id = session_id;
@@ -494,7 +457,11 @@ fn set_provider(app: &mut App, provider: &str) -> Result<()> {
 fn set_model(app: &mut App, model: &str) -> Result<()> {
     let agent = app.agent.as_mut().context("agent is already running")?;
     let provider = agent.config.model.provider(&agent.config.providers)?;
-    let models = list_models(&agent.config.model, &agent.config.providers)?;
+    let models = list_models(
+        &agent.config.app_dir_name,
+        &agent.config.model,
+        &agent.config.providers,
+    )?;
     if !models.is_empty() && !models.iter().any(|known| known == model) {
         anyhow::bail!(
             "model '{}' is not listed for provider '{}'; use /model add {}",
@@ -541,14 +508,14 @@ fn set_effort(app: &mut App, effort: &str) -> Result<()> {
 }
 
 fn set_mode(app: &mut App, mode: &str) -> Result<()> {
-    let mode = load_plugin(mode).with_context(|| format!("failed to load mode '{mode}'"))?;
+    let mode = load_plugin(&app.app_dir_name, mode)
+        .with_context(|| format!("failed to load mode '{mode}'"))?;
     if mode.kind != PluginKind::Mode {
         anyhow::bail!("plugin '{}' is not a mode", mode.id);
     }
 
-    let agent = app.agent.as_mut().context("agent is already running")?;
-    agent.config.agent.default_mode = mode.id.clone();
-    agent.system = compose_prompt(
+    let system = compose_prompt(
+        &app.app_dir_name,
         DEFAULT_SYSTEM_PROMPT,
         Some(&mode),
         &app.plugins,
@@ -556,9 +523,12 @@ fn set_mode(app: &mut App, mode: &str) -> Result<()> {
         app.append_system_prompt.as_deref(),
         app.ignore_plugin_errors,
     )?;
-    let mut saved = Config::load_default()?;
-    saved.agent.default_mode = agent.config.agent.default_mode.clone();
-    saved.save_default()?;
+    let agent = app.agent.as_mut().context("agent is already running")?;
+    agent.config.agent.default_mode = mode.id.clone();
+    agent.system = system;
+    let mut saved = Config::load_from_app(&app.app_dir_name)?;
+    saved.agent.default_mode = mode.id.clone();
+    saved.save()?;
 
     app.mode = mode.id;
     app.messages.push(Message {
@@ -574,10 +544,10 @@ fn set_mode(app: &mut App, mode: &str) -> Result<()> {
 }
 
 fn save_model_config(config: &Config) -> Result<()> {
-    let mut saved = Config::load_default()?;
+    let mut saved = Config::load_from_app(&config.app_dir_name)?;
     saved.model = config.model.clone();
     saved.providers = config.providers.clone();
-    saved.save_default()
+    saved.save()
 }
 
 fn open_selection(

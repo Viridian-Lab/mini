@@ -3,12 +3,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::{cursor, execute, queue, terminal};
 use mini_agent_core::{
     Agent, AgentEvent, BUILT_IN_PROVIDER_NAMES, Config, DEFAULT_CONTEXT_WINDOW_TOKENS,
-    DEFAULT_SYSTEM_PROMPT, ModelMessage, ModelRole, Plugin, PluginError, PluginKind,
-    ProviderConfig, compose_prompt, estimate_messages_tokens, install_scripts, list_models,
+    DEFAULT_SYSTEM_PROMPT, ModelMessage, ModelRole, Plugin, PluginKind, ProviderConfig,
+    compose_prompt, estimate_messages_tokens, install_scripts, list_models, load_active_plugins,
     load_plugin,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +20,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // waverows from @agilek/cli-loaders / unicode-animations.
 const SPINNER: [&str; 16] = [
@@ -134,6 +134,7 @@ struct Selection {
 }
 
 struct App {
+    app_dir_name: String,
     messages: Vec<Message>,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -171,6 +172,7 @@ struct App {
 }
 
 pub struct RunOptions {
+    pub app_dir_name: String,
     pub system_prompt: String,
     pub config: Config,
     pub mode: String,

@@ -54,11 +54,7 @@ struct TokenResponse {
     account_id: Option<String>,
 }
 
-pub fn auth_status() -> Result<Option<StoredAuth>> {
-    auth_status_for_app(".mini-agent")
-}
-
-pub fn auth_status_for_app(app_dir_name: &str) -> Result<Option<StoredAuth>> {
+pub fn auth_status(app_dir_name: &str) -> Result<Option<StoredAuth>> {
     let Some(paths) = Config::app_paths(app_dir_name) else {
         return Ok(None);
     };
@@ -69,11 +65,7 @@ pub fn auth_status_for_app(app_dir_name: &str) -> Result<Option<StoredAuth>> {
     Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?))
 }
 
-pub fn logout() -> Result<()> {
-    logout_for_app(".mini-agent")
-}
-
-pub fn logout_for_app(app_dir_name: &str) -> Result<()> {
+pub fn logout(app_dir_name: &str) -> Result<()> {
     let Some(paths) = Config::app_paths(app_dir_name) else {
         return Ok(());
     };
@@ -84,11 +76,7 @@ pub fn logout_for_app(app_dir_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn oauth_login(show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
-    oauth_login_for_app(".mini-agent", show_url)
-}
-
-pub fn oauth_login_for_app(app_dir_name: &str, show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
+pub fn oauth_login(app_dir_name: &str, show_url: impl FnOnce(&str)) -> Result<StoredAuth> {
     let listener = TcpListener::bind(("127.0.0.1", OPENAI_CODEX_REDIRECT_PORT)).with_context(
         || format!("failed to start localhost OAuth callback listener on port {OPENAI_CODEX_REDIRECT_PORT}"),
     )?;
@@ -153,12 +141,8 @@ pub fn oauth_login_for_app(app_dir_name: &str, show_url: impl FnOnce(&str)) -> R
     Ok(auth)
 }
 
-pub fn codex_auth() -> Result<Option<AuthTokens>> {
-    codex_auth_for_app(".mini-agent")
-}
-
-pub fn codex_auth_for_app(app_dir_name: &str) -> Result<Option<AuthTokens>> {
-    let Some(mut auth) = auth_status_for_app(app_dir_name)? else {
+pub fn codex_auth(app_dir_name: &str) -> Result<Option<AuthTokens>> {
+    let Some(mut auth) = auth_status(app_dir_name)? else {
         return Ok(None);
     };
 
@@ -181,7 +165,7 @@ pub fn codex_auth_for_app(app_dir_name: &str) -> Result<Option<AuthTokens>> {
 
     if auth.tokens.account_id.is_none() {
         auth.tokens.account_id = chatgpt_account_id(&auth.tokens.access_token);
-        changed = auth.tokens.account_id.is_some();
+        changed = changed || auth.tokens.account_id.is_some();
     }
 
     if changed {
@@ -245,24 +229,41 @@ fn chatgpt_account_id(access_token: &str) -> Option<String> {
 fn save_auth(app_dir_name: &str, auth: &StoredAuth) -> Result<()> {
     let paths = Config::ensure_app_files(app_dir_name)?.context("HOME is not set")?;
     let path = paths.root.join("auth.json");
-    std::fs::write(&path, serde_json::to_string_pretty(auth)?)
-        .with_context(|| format!("failed to write '{}'", path.display()))?;
+    // Write to a sibling temp file and rename so a concurrent reader never
+    // observes a truncated auth.json mid-write.
+    let temp = paths.root.join("auth.json.tmp");
+    std::fs::write(&temp, serde_json::to_string_pretty(auth)?)
+        .with_context(|| format!("failed to write '{}'", temp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
     }
+    std::fs::rename(&temp, &path)
+        .with_context(|| format!("failed to write '{}'", path.display()))?;
     Ok(())
 }
 
 fn wait_for_callback(listener: TcpListener, state: &str) -> Result<String> {
-    listener.set_nonblocking(false)?;
+    // Non-blocking accept with a poll loop so the deadline is actually
+    // enforced; a blocking accept() would hang forever if the user never
+    // completes the browser flow.
+    listener.set_nonblocking(true)?;
     let deadline = SystemTime::now() + Duration::from_secs(300);
     loop {
         if SystemTime::now() > deadline {
             anyhow::bail!("OAuth login timed out");
         }
-        let (mut stream, _) = listener.accept()?;
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = [0; 8192];
         let read = stream.read(&mut request)?;
         let request = String::from_utf8_lossy(&request[..read]);
@@ -270,7 +271,15 @@ fn wait_for_callback(listener: TcpListener, state: &str) -> Result<String> {
         let Some(target) = first_line.split_whitespace().nth(1) else {
             continue;
         };
-        let url = Url::parse(&format!("http://127.0.0.1{target}"))?;
+        let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+            continue;
+        };
+        if url.path() != "/auth/callback" {
+            // Ignore favicon requests and other local probes instead of
+            // failing the login on their missing state parameter.
+            let _ = respond_status(&mut stream, "404 Not Found", "Not found.");
+            continue;
+        }
         let mut code = None;
         let mut returned_state = None;
         let mut error = None;
@@ -301,9 +310,13 @@ fn wait_for_callback(listener: TcpListener, state: &str) -> Result<String> {
 }
 
 fn respond(stream: &mut impl Write, body: &str) -> Result<()> {
+    respond_status(stream, "200 OK", body)
+}
+
+fn respond_status(stream: &mut impl Write, status: &str, body: &str) -> Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     )?;

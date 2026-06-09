@@ -1,5 +1,5 @@
-fn sessions_dir() -> Result<PathBuf> {
-    let Some(paths) = Config::ensure_user_files()? else {
+fn sessions_dir(app_dir_name: &str) -> Result<PathBuf> {
+    let Some(paths) = Config::ensure_app_files(app_dir_name)? else {
         anyhow::bail!("HOME is not set, so sessions cannot be stored");
     };
     let dir = paths.state_dir.join("sessions");
@@ -8,17 +8,17 @@ fn sessions_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn session_path(id: &str) -> Result<PathBuf> {
+fn session_path(app_dir_name: &str, id: &str) -> Result<PathBuf> {
     if id.contains('/') || id.contains('\\') || id == "." || id == ".." {
         anyhow::bail!("session id must be a plain name");
     }
-    Ok(sessions_dir()?.join(format!("{id}.json")))
+    Ok(sessions_dir(app_dir_name)?.join(format!("{id}.json")))
 }
 
-fn load_session(spec: &str) -> Result<StoredSession> {
+fn load_session(app_dir_name: &str, spec: &str) -> Result<StoredSession> {
     let path = if spec == "latest" {
         let mut latest = None;
-        for entry in std::fs::read_dir(sessions_dir()?)? {
+        for entry in std::fs::read_dir(sessions_dir(app_dir_name)?)? {
             let entry = entry?;
             let path = entry.path();
             if path
@@ -38,12 +38,14 @@ fn load_session(spec: &str) -> Result<StoredSession> {
             .map(|(path, _)| path)
             .context("no saved sessions found")?
     } else {
-        session_path(spec)?
+        session_path(app_dir_name, spec)?
     };
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&source)
-        .with_context(|| format!("session file '{}' is invalid", path.display()))
+    let mut session: StoredSession = serde_json::from_str(&source)
+        .with_context(|| format!("session file '{}' is invalid", path.display()))?;
+    session.config.app_dir_name = app_dir_name.to_string();
+    Ok(session)
 }
 
 fn save_session(app: &mut App) -> Result<()> {
@@ -54,12 +56,13 @@ fn save_session(app: &mut App) -> Result<()> {
         app.session_title = session_title_from_messages(&agent.messages);
     }
 
-    let path = session_path(&app.session_id)?;
+    let path = session_path(&app.app_dir_name, &app.session_id)?;
     if app.session_title.is_none() {
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("failed to remove empty session '{}'", path.display()))?;
-        }
+        // Nothing worth persisting yet. Do not remove the file: with
+        // `--session <id>` the id can already name a saved conversation that we
+        // have not loaded, and deleting it would silently destroy it. A
+        // genuinely new session has no file until it gets a title, so this
+        // never litters empty sessions.
         return Ok(());
     }
 
@@ -159,4 +162,3 @@ fn messages_from_history(messages: &[ModelMessage]) -> Vec<Message> {
     }
     rendered
 }
-

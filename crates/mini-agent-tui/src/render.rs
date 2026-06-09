@@ -1,5 +1,5 @@
 fn startup_banner_rows(app: &App, max_width: u16) -> Vec<String> {
-    let workspace = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    let workspace = if let Some(home) = Config::home_dir()
         && let Ok(relative) = app.cwd.strip_prefix(home)
     {
         if relative.as_os_str().is_empty() {
@@ -14,7 +14,7 @@ fn startup_banner_rows(app: &App, max_width: u16) -> Vec<String> {
         ("mini", env!("CARGO_PKG_VERSION").to_string()),
         (
             "plugins",
-            Config::user_paths()
+            Config::app_paths(&app.app_dir_name)
                 .and_then(|paths| {
                     std::fs::read_dir(paths.plugins_dir).ok().map(|entries| {
                         entries
@@ -242,13 +242,40 @@ fn render(stdout: &mut Stdout, app: &mut App) -> Result<u16> {
     } else {
         input_chars.into_iter().collect::<String>()
     };
-    let mut input_lines = wrap_chars(&input_text, content_width.max(1));
-    for line in &mut input_lines {
-        if line.contains('▌') {
-            *line = line.replace('▌', &paint("▌", BOLD_WHITE));
+    // Wrap each logical (newline-separated) line independently so pasted
+    // multi-line input renders across rows instead of collapsing.
+    let mut input_lines: Vec<String> = Vec::new();
+    for segment in input_text.split('\n') {
+        let wrapped = wrap_chars(segment, content_width.max(1));
+        if wrapped.is_empty() {
+            input_lines.push(String::new());
+        } else {
+            input_lines.extend(wrapped);
         }
     }
-    let input_rows = input_lines.len().min(5);
+    // Window a fixed-height viewport around the cursor so it stays visible once
+    // the input grows past the cap.
+    const MAX_INPUT_ROWS: usize = 5;
+    let input_rows = input_lines.len().min(MAX_INPUT_ROWS);
+    let cursor_row = input_lines
+        .iter()
+        .position(|line| line.contains('▌'))
+        .unwrap_or(0);
+    let start = cursor_row
+        .saturating_sub(input_rows.saturating_sub(1))
+        .min(input_lines.len().saturating_sub(input_rows));
+    let input_lines: Vec<String> = input_lines
+        .into_iter()
+        .skip(start)
+        .take(input_rows)
+        .map(|line| {
+            if line.contains('▌') {
+                line.replace('▌', &paint("▌", BOLD_WHITE))
+            } else {
+                line
+            }
+        })
+        .collect();
     let status = if app.running.is_some() {
         let elapsed = app
             .running_since
@@ -280,7 +307,7 @@ fn render(stdout: &mut Stdout, app: &mut App) -> Result<u16> {
     let status = paint(&status, BOLD_WHITE);
     let model = paint(&format!("{context} {model}"), BRIGHT_BLACK);
     bottom_rows.push(top_border(width));
-    for line in input_lines.iter().take(input_rows) {
+    for line in &input_lines {
         if width < 4 {
             bottom_rows.push(fit(line, width as usize));
         } else {
@@ -290,13 +317,21 @@ fn render(stdout: &mut Stdout, app: &mut App) -> Result<u16> {
                 "{} {}{} {}",
                 paint("│", INPUT_FRAME),
                 line,
-                " ".repeat(inner - visible_width(&line)),
+                " ".repeat(inner.saturating_sub(visible_width(&line))),
                 paint("│", INPUT_FRAME)
             ));
         }
     }
     bottom_rows.push(bottom_border(width, &status, &model));
 
+    // Draw the bottom box with line-wrap disabled so a row whose terminal width
+    // is mismeasured (e.g. the spinner's Braille glyphs, which some terminals
+    // render wider than `unicode-width` reports) is truncated to a single
+    // physical line instead of wrapping. Wrapping would make the next frame's
+    // cursor-up short and leave a stale row (the input box top border drawn
+    // twice). Message output above keeps wrapping; only the fixed-shape bottom
+    // box is constrained here.
+    queue!(stdout, terminal::DisableLineWrap)?;
     for (index, row) in bottom_rows.iter().enumerate() {
         if index + 1 == bottom_rows.len() {
             write!(stdout, "{row}")?;
@@ -304,6 +339,7 @@ fn render(stdout: &mut Stdout, app: &mut App) -> Result<u16> {
             write!(stdout, "{row}\r\n")?;
         }
     }
+    queue!(stdout, terminal::EnableLineWrap)?;
     stdout.flush()?;
     Ok(bottom_rows.len().saturating_sub(1) as u16)
 }
@@ -322,7 +358,15 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::Assistant(text) => {
             if app.streaming_started {
-                app.streaming_text = text;
+                // Finalize using the accumulated streamed deltas, not the
+                // event's `text`. The rows already committed to scrollback were
+                // rendered from the deltas, and `stream_final_skip_rows` skips
+                // exactly that many rows when the message is reprinted. If the
+                // final `text` differs from the deltas (whitespace, provider
+                // normalization), the skip would be off by a row, reprinting a
+                // committed row (input box top line drawn twice) and drifting
+                // the bottom-row accounting so every later frame redraws more.
+                let _ = text;
                 app.streaming_started = false;
                 app.stream_message_cutoff = None;
                 app.stream_final_skip_rows = Some(app.streaming_committed_rows);
@@ -346,6 +390,37 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             text: command,
             output: None,
         }),
+        AgentEvent::ToolUse { name, input } => app.messages.push(Message {
+            role: Role::Command,
+            text: format!("{name} {input}"),
+            output: None,
+        }),
+        AgentEvent::ToolResult {
+            name: _,
+            output,
+            is_error,
+        } => {
+            let text = if is_error {
+                format!("error:\n{}", truncate_output(output.trim_end()))
+            } else {
+                truncate_output(output.trim_end())
+            };
+            if let Some(command) = app
+                .messages
+                .iter_mut()
+                .rev()
+                .take_while(|message| message.role != Role::User)
+                .find(|message| message.role == Role::Command && message.output.is_none())
+            {
+                command.output = Some(text);
+            } else {
+                app.messages.push(Message {
+                    role: Role::Output,
+                    text,
+                    output: None,
+                });
+            }
+        }
         AgentEvent::CommandOutput(output) => {
             let mut text = String::new();
             if output.status != Some(0) {

@@ -17,7 +17,7 @@ reason = "The subagents plugin needs `mini` in PATH so the `subagents` helper ca
 set -euo pipefail
 
 ma="${MINI_BIN:-${MINI_AGENT_BIN:-mini}}"
-home="${MINI_AGENT_HOME:-${HOME:?HOME is not set}/.mini-agent}"
+home="${AGENT_HOME:?AGENT_HOME is not set}"
 runs="$home/state/subagents/runs"
 workspaces="$home/state/subagents/workspaces"
 
@@ -139,7 +139,7 @@ subagents show parser-scan
 
 {% if plugins.jj.exists %}
 The helper automatically creates a separate `jj` workspace under
-`~/.mini-agent/state/subagents/workspaces` for every subagent run, so background
+the agent state directory's `subagents/workspaces` tree for every subagent run, so background
 editing work does not share the parent's working copy:
 
 ```bash

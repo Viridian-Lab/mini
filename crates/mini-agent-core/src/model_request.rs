@@ -12,34 +12,71 @@ fn bash_tool_parameters() -> Value {
     })
 }
 
-fn bash_tool_for(protocol: ModelProtocol) -> Value {
+/// Render a single tool definition into the wire shape for `protocol`. `strict`
+/// only applies to the OpenAI Responses API and is reserved for the built-in
+/// bash tool whose schema satisfies strict-mode constraints; mounted tools
+/// (e.g. MCP) carry arbitrary JSON Schemas, so they are sent non-strict.
+fn tool_schema_for(
+    protocol: ModelProtocol,
+    name: &str,
+    description: &str,
+    parameters: &Value,
+    strict: bool,
+) -> Value {
     match protocol {
-        ModelProtocol::OpenAiResponses => json!({
-            "type": "function",
-            "name": "bash",
-            "description": "Run a shell command with bash -lc in the current workspace.",
-            "parameters": bash_tool_parameters(),
-            "strict": true,
-        }),
+        ModelProtocol::OpenAiResponses => {
+            let mut tool = json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            });
+            if strict {
+                tool["strict"] = json!(true);
+            }
+            tool
+        }
         ModelProtocol::OpenAiChatCompletions => json!({
             "type": "function",
             "function": {
-                "name": "bash",
-                "description": "Run a shell command with bash -lc in the current workspace.",
-                "parameters": bash_tool_parameters(),
+                "name": name,
+                "description": description,
+                "parameters": parameters,
             }
         }),
         ModelProtocol::Anthropic => json!({
-            "name": "bash",
-            "description": "Run a shell command with bash -lc in the current workspace.",
-            "input_schema": bash_tool_parameters(),
+            "name": name,
+            "description": description,
+            "input_schema": parameters,
         }),
         ModelProtocol::Gemini => json!({
-            "name": "bash",
-            "description": "Run a shell command with bash -lc in the current workspace.",
-            "parameters": bash_tool_parameters(),
+            "name": name,
+            "description": description,
+            "parameters": parameters,
         }),
     }
+}
+
+/// The full tool list for a request: the always-present built-in `bash` plus
+/// any mounted tools.
+fn tool_schemas(protocol: ModelProtocol, tools: &[ToolSpec]) -> Vec<Value> {
+    let mut schemas = vec![tool_schema_for(
+        protocol,
+        "bash",
+        "Run a shell command with bash -lc in the current workspace.",
+        &bash_tool_parameters(),
+        true,
+    )];
+    for tool in tools {
+        schemas.push(tool_schema_for(
+            protocol,
+            &tool.name,
+            &tool.description,
+            &tool.input_schema,
+            false,
+        ));
+    }
+    schemas
 }
 
 fn role_name(role: ModelRole, protocol: ModelProtocol) -> &'static str {
@@ -50,13 +87,25 @@ fn role_name(role: ModelRole, protocol: ModelProtocol) -> &'static str {
     }
 }
 
+/// For providers without a structured tool-result error flag (OpenAI, Gemini),
+/// prefix a marker so the model still recognizes a failed tool call. Anthropic
+/// carries `is_error` on the tool_result block instead.
+fn marked_tool_content(content: &str, is_error: bool) -> String {
+    if is_error {
+        format!("[tool error]\n{content}")
+    } else {
+        content.to_string()
+    }
+}
+
 pub(crate) fn request_body(
     system: &str,
     messages: &[ModelMessage],
     config: &ModelConfig,
     provider: &Provider,
+    tools: &[ToolSpec],
 ) -> Value {
-    request_body_with_tools(system, messages, config, provider, true, true)
+    request_body_with_tools(system, messages, config, provider, Some(tools), true)
 }
 
 pub(crate) fn request_body_without_tools(
@@ -65,7 +114,7 @@ pub(crate) fn request_body_without_tools(
     config: &ModelConfig,
     provider: &Provider,
 ) -> Value {
-    request_body_with_tools(system, messages, config, provider, false, true)
+    request_body_with_tools(system, messages, config, provider, None, true)
 }
 
 fn request_body_with_tools(
@@ -73,7 +122,7 @@ fn request_body_with_tools(
     messages: &[ModelMessage],
     config: &ModelConfig,
     provider: &Provider,
-    tools: bool,
+    tools: Option<&[ToolSpec]>,
     stream: bool,
 ) -> Value {
     match provider.protocol {
@@ -84,7 +133,7 @@ fn request_body_with_tools(
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": result.id,
-                        "output": result.content,
+                        "output": marked_tool_content(&result.content, result.is_error),
                     }));
                     continue;
                 }
@@ -109,8 +158,8 @@ fn request_body_with_tools(
                 "stream": stream,
                 "store": false,
             });
-            if tools {
-                body["tools"] = json!([bash_tool_for(provider.protocol)]);
+            if let Some(tools) = tools {
+                body["tools"] = json!(tool_schemas(provider.protocol, tools));
             }
             if !system.trim().is_empty() {
                 body["instructions"] = json!(system);
@@ -144,7 +193,7 @@ fn request_body_with_tools(
                     return json!({
                         "role": "tool",
                         "tool_call_id": result.id,
-                        "content": result.content,
+                        "content": marked_tool_content(&result.content, result.is_error),
                     });
                 }
                 let mut item = json!({
@@ -177,8 +226,8 @@ fn request_body_with_tools(
                 "messages": items,
                 "stream": stream,
             });
-            if tools {
-                body["tools"] = json!([bash_tool_for(provider.protocol)]);
+            if let Some(tools) = tools {
+                body["tools"] = json!(tool_schemas(provider.protocol, tools));
             }
             if let Some(max_output_tokens) = config.max_output_tokens {
                 body["max_completion_tokens"] = json!(max_output_tokens);
@@ -206,11 +255,15 @@ fn request_body_with_tools(
                         .get(index)
                         .and_then(|message| message.tool_result.as_ref())
                     {
-                        content.push(json!({
+                        let mut block = json!({
                             "type": "tool_result",
                             "tool_use_id": result.id,
                             "content": result.content,
-                        }));
+                        });
+                        if result.is_error {
+                            block["is_error"] = json!(true);
+                        }
+                        content.push(block);
                         index += 1;
                     }
                     items.push(json!({
@@ -221,8 +274,18 @@ fn request_body_with_tools(
                 }
 
                 let message = &messages[index];
-                if !message.tool_calls.is_empty() {
+                // Replay captured thinking blocks (with their signatures) as the
+                // leading content. The API requires this before tool_result
+                // blocks when thinking is enabled. Only do it when thinking is
+                // currently enabled, so disabling reasoning mid-session does not
+                // send stale thinking blocks the API would reject.
+                let replay_thinking =
+                    reasoning_effort(config).is_some() && !message.thinking.is_empty();
+                if !message.tool_calls.is_empty() || replay_thinking {
                     let mut content = Vec::new();
+                    if replay_thinking {
+                        content.extend(message.thinking.iter().cloned());
+                    }
                     if !message.text.is_empty() {
                         content.push(json!({ "type": "text", "text": message.text }));
                     }
@@ -251,19 +314,22 @@ fn request_body_with_tools(
                 "messages": items,
                 "stream": stream,
             });
-            if tools {
-                body["tools"] = json!([bash_tool_for(provider.protocol)]);
+            if let Some(tools) = tools {
+                body["tools"] = json!(tool_schemas(provider.protocol, tools));
             }
             if let Some(effort) = reasoning_effort(config) {
-                let budget_tokens = effort.parse().unwrap_or(match effort {
-                    "on" | "true" | "yes" | "medium" => 3072,
-                    "minimal" => 1024,
-                    "low" => 2048,
-                    "high" => 8192,
-                    "xhigh" => 16384,
-                    _ => 3072,
-                });
-                max_tokens = max_tokens.max(budget_tokens + 1024);
+                let budget_tokens: u32 = effort
+                    .parse::<u32>()
+                    .map(|tokens| tokens.clamp(1024, 200_000))
+                    .unwrap_or(match effort {
+                        "on" | "true" | "yes" | "medium" => 3072,
+                        "minimal" => 1024,
+                        "low" => 2048,
+                        "high" => 8192,
+                        "xhigh" => 16384,
+                        _ => 3072,
+                    });
+                max_tokens = max_tokens.max(budget_tokens.saturating_add(1024));
                 body["thinking"] = json!({
                     "type": "enabled",
                     "budget_tokens": budget_tokens,
@@ -273,7 +339,11 @@ fn request_body_with_tools(
             if !system.trim().is_empty() {
                 body["system"] = json!(system);
             }
-            if let Some(temperature) = config.temperature {
+            // Anthropic rejects a temperature other than 1 when extended
+            // thinking is enabled, so only forward it when thinking is off.
+            if let Some(temperature) = config.temperature
+                && reasoning_effort(config).is_none()
+            {
                 body["temperature"] = json!(temperature);
             }
             body
@@ -291,7 +361,9 @@ fn request_body_with_tools(
                         parts.push(json!({
                             "functionResponse": {
                                 "name": result.name,
-                                "response": { "output": result.content },
+                                "response": {
+                                    "output": marked_tool_content(&result.content, result.is_error),
+                                },
                             }
                         }));
                         index += 1;
@@ -325,9 +397,9 @@ fn request_body_with_tools(
             let mut body = json!({
                 "contents": contents,
             });
-            if tools {
+            if let Some(tools) = tools {
                 body["tools"] = json!([{
-                    "functionDeclarations": [bash_tool_for(provider.protocol)]
+                    "functionDeclarations": tool_schemas(provider.protocol, tools)
                 }]);
             }
 
