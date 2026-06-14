@@ -65,7 +65,12 @@ fn call_model_with_body(
 
     let response = send_with_retry(&client, &endpoint, &body, &headers, &interrupted)?;
 
-    if provider.protocol != ModelProtocol::Gemini {
+    let is_event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("event-stream"));
+    if is_event_stream {
         let response =
             streamed_assistant_response(provider.protocol, response, on_delta, interrupted)?;
         if tools.is_none() && !response.tool_calls.is_empty() {

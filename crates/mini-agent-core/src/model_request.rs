@@ -105,7 +105,7 @@ pub(crate) fn request_body(
     provider: &Provider,
     tools: &[ToolSpec],
 ) -> Value {
-    request_body_with_tools(system, messages, config, provider, Some(tools), true)
+    request_body_with_tools(system, messages, config, provider, Some(tools), config.stream.unwrap_or(true))
 }
 
 pub(crate) fn request_body_without_tools(
@@ -114,7 +114,7 @@ pub(crate) fn request_body_without_tools(
     config: &ModelConfig,
     provider: &Provider,
 ) -> Value {
-    request_body_with_tools(system, messages, config, provider, None, true)
+    request_body_with_tools(system, messages, config, provider, None, config.stream.unwrap_or(true))
 }
 
 fn request_body_with_tools(

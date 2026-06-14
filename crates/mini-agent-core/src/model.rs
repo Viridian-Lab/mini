@@ -36,6 +36,9 @@ pub struct ModelConfig {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// false → non-streaming request + JSON response (else SSE). default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 impl Default for ModelConfig {
@@ -50,6 +53,7 @@ impl Default for ModelConfig {
             max_output_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            stream: None,
         }
     }
 }
